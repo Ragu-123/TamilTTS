@@ -11,7 +11,7 @@ class ResBlock1d(nn.Module):
         return x + self.conv2(torch.relu(self.conv1(x)))
 
 class FullVocoder(nn.Module):
-    """HiFi-GAN V1 scale vocoder — ~17.5M params."""
+    """HiFi-GAN V1 scale, ~17.5M params. Output: [B, T_audio]."""
     def __init__(self, in_channels=80, upsample_initial_channel=1024):
         super().__init__()
         self.conv_pre = nn.Conv1d(in_channels, upsample_initial_channel, 7, 1, padding=3)
@@ -26,9 +26,11 @@ class FullVocoder(nn.Module):
         self.conv_post = nn.Conv1d(64, 1, 7, 1, padding=3)
 
     def forward(self, x):
-        x = self.conv_pre(x.transpose(1, 2))
-        x = self.res1(torch.relu(self.up1(x)))
-        x = self.res2(torch.relu(self.up2(x)))
-        x = self.res3(torch.relu(self.up3(x)))
-        x = self.res4(torch.relu(self.up4(x)))
-        return self.conv_post(x).transpose(1, 2)
+        # x: [B, T_mel, 80]
+        x = self.conv_pre(x.transpose(1, 2))          # [B, 1024, T_mel]
+        x = self.res1(torch.relu(self.up1(x)))         # [B, 512,  T*8]
+        x = self.res2(torch.relu(self.up2(x)))         # [B, 256,  T*64]
+        x = self.res3(torch.relu(self.up3(x)))         # [B, 128,  T*128]
+        x = self.res4(torch.relu(self.up4(x)))         # [B, 64,   T*256]
+        x = torch.tanh(self.conv_post(x))              # [B, 1,    T_audio]
+        return x.squeeze(1)                            # [B, T_audio] ← FIXED

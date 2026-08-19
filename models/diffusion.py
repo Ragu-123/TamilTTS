@@ -11,7 +11,7 @@ class ResBlock1d(nn.Module):
         return x + self.conv2(torch.relu(self.conv1(x)))
 
 class DiffusionProsody(nn.Module):
-    """8-block residual diffusion for prosody — ~14.3M params."""
+    """8-block residual diffusion conditioned on style, ~14.3M params."""
     def __init__(self, in_channels=512, style_dim=256, hidden_channels=512):
         super().__init__()
         self.style_cond = nn.Linear(style_dim, hidden_channels)
@@ -20,8 +20,9 @@ class DiffusionProsody(nn.Module):
         self.conv_out = nn.Conv1d(hidden_channels, in_channels, 3, padding=1)
 
     def forward(self, x, style):
-        s = self.style_cond(style).unsqueeze(-1)
-        x = self.conv_in(x.transpose(1, 2)) + s
+        # x: [B, T, 512], style: [B, 256]
+        s = self.style_cond(style).unsqueeze(-1)        # [B, 512, 1]
+        x = self.conv_in(x.transpose(1, 2)) + s         # [B, 512, T]
         for b in self.blocks:
             x = b(x)
-        return self.conv_out(x).transpose(1, 2)
+        return self.conv_out(x).transpose(1, 2)          # [B, T, 512]

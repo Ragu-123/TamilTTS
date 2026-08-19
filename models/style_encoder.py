@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class StyleEncoder(nn.Module):
-    """Extracts global speaking style from reference mel — ~4.5M params."""
+    """Conv + GRU style extractor, ~4.54M params."""
     def __init__(self, mel_channels=80, hidden_dim=512, style_dim=256):
         super().__init__()
         self.convs = nn.Sequential(
@@ -14,6 +14,7 @@ class StyleEncoder(nn.Module):
         self.proj = nn.Linear(hidden_dim, style_dim)
 
     def forward(self, mel):
-        x = self.convs(mel).transpose(1, 2)
-        _, h = self.rnn(x)
-        return self.proj(h[-1])
+        # mel: [B, 80, T_mel]
+        x = self.convs(mel).transpose(1, 2)   # [B, T', 512]
+        _, h = self.rnn(x)                     # h: [1, B, 512]
+        return self.proj(h[-1])                # [B, 256]

@@ -1,1 +1,1 @@
-from .dataset import ShrutilipiDataset, get_dataloader
+from .dataset import ShrutilipiDataset, build_dataloaders
