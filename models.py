@@ -73,5 +73,8 @@ class TamilTTS(nn.Module):
         text_features = self.text_encoder(text_tokens)
         style_vector = self.style_encoder(ref_mel)
         prosody = self.diffusion_prosody(text_features, style_vector, diffusion_time)
-        audio = self.vocoder(text_features)
+        
+        # Merge prosody and text features (Simplified multiplication for alignment proxy)
+        aligned_features = text_features * prosody[:, :, 0:1] # Duration scaling proxy
+        audio = self.vocoder(aligned_features)
         return audio, prosody
