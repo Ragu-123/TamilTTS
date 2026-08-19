@@ -30,7 +30,7 @@ class Config:
 
     # --- Training ---
     total_steps    = 300_000
-    batch_size     = 8        # Per DataLoader (split across GPUs by DataParallel)
+    batch_size     = 32       # 8 per GPU across 4 GPUs
     num_workers    = 4
     learning_rate  = 1e-4
     warmup_steps   = 10_000
