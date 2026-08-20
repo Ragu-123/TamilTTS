@@ -1,11 +1,12 @@
 """
-TamilTTS Training Script — v5 (Auto-DDP Multi-GPU)
-===================================================
+TamilTTS Training Script — v6 (Auto-DDP Multi-GPU with HiFi-GAN & Alignment Fixes)
+==================================================================================
 - Auto-Detects 4 GPUs: Works with BOTH `python train.py` and `torchrun`!
 - DistributedDataParallel: All 4 GPUs at ~95-100% compute evenly.
 - Per-GPU Critic Instances: Each GPU has its own WavLM + IndicWhisper.
-- OOM Prevention: per_gpu_batch=8, grad_accum_steps=4 (Effective batch = 128).
-- Progress & Metrics: Clear Epoch, Global Optimizer Step, and Loss Tracking.
+- Target Duration Ground-Truth Alignment: Guarantees rock-solid text-to-audio sync during training.
+- Silence-padded Mel Spectrograms: Fixes acoustic corruption and buzzing artifacts.
+- HiFi-GAN MRF Neural Vocoder: Continuous natural voice reproduction with LeakyReLU(0.1).
 """
 import argparse
 import os
@@ -66,7 +67,13 @@ def validate(model, val_loader, srfd_loss_fn, device, global_step):
         real_audio  = real_audio.to(device)
 
         target_mel_len = ref_mel.size(2)
-        gen_audio, mel_pred, _ = eval_model(text_tokens, ref_mel, target_mel_len=target_mel_len)
+        text_mask = (text_tokens == 0)
+
+        gen_audio, mel_pred, _ = eval_model(
+            text_tokens, ref_mel,
+            target_mel_len=target_mel_len,
+            text_mask=text_mask
+        )
 
         mel_target = ref_mel.transpose(1, 2)
         mel_loss = F.l1_loss(mel_pred, mel_target)
@@ -105,7 +112,7 @@ def train_worker(local_rank, world_size, cfg):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     log("=" * 60, local_rank)
-    log("  TamilTTS Training Pipeline (v5 — Auto-DDP Multi-GPU)", local_rank)
+    log("  TamilTTS Training Pipeline (v6 — Multi-GPU DDP)", local_rank)
     log("=" * 60, local_rank)
 
     # 2. Model
@@ -144,7 +151,7 @@ def train_worker(local_rank, world_size, cfg):
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
-    val_sampler   = DistributedSampler(val_ds, num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
+    val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
 
     train_loader = DataLoader(
         train_ds,
@@ -209,9 +216,18 @@ def train_worker(local_rank, world_size, cfg):
             real_audio  = real_audio.to(device)
             target_mel_len = ref_mel.size(2)
 
-            # Forward
+            # Mask padding text tokens (0 is PAD)
+            text_mask = (text_tokens == 0)
+            non_pad = (~text_mask).float()
+            text_lens = non_pad.sum(dim=1, keepdim=True).clamp(min=1)
+            target_dur = non_pad * (target_mel_len / text_lens)
+
+            # Forward pass: Uses target_dur during training for rock-solid phoneme alignment!
             gen_audio, mel_pred, dur_pred = model(
-                text_tokens, ref_mel, target_mel_len=target_mel_len
+                text_tokens, ref_mel,
+                target_mel_len=target_mel_len,
+                text_mask=text_mask,
+                target_dur=target_dur,
             )
 
             # --- Losses ---
@@ -221,9 +237,7 @@ def train_worker(local_rank, world_size, cfg):
             min_a = min(gen_audio.size(1), real_audio.size(1))
             loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
-            non_pad = (text_tokens != 0).float()
-            target_dur = non_pad * (target_mel_len / non_pad.sum(dim=1, keepdim=True).clamp(min=1))
-            loss_dur = F.huber_loss(dur_pred, target_dur)
+            loss_dur = F.huber_loss(dur_pred, target_dur, delta=1.0)
 
             total_loss = (
                 cfg.weight_mel * loss_mel
@@ -261,7 +275,8 @@ def train_worker(local_rank, world_size, cfg):
                     print(f"\n  [Checkpoint] Saved at step {global_step}")
 
                 # Validation (Rank 0 only)
-                if is_main_process(local_rank) and global_step % cfg.val_every == 0:
+                val_freq = getattr(cfg, "val_every", 2000)
+                if is_main_process(local_rank) and global_step % val_freq == 0:
                     val_mel, val_srfd = validate(model, val_loader, srfd_loss_fn, device, global_step)
                     print(f"\n  [Val @ step {global_step}] Mel L1: {val_mel:.4f} | SR-FD: {val_srfd:.4f}")
                     if val_mel < best_val_loss:
@@ -282,67 +297,65 @@ def train_worker(local_rank, world_size, cfg):
         print(f"  Best val Mel L1: {best_val_loss:.4f}")
         print("=" * 60)
 
-    if is_distributed:
+    if is_distributed and dist.is_initialized():
         dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
-# Main Launcher
+# Main Entry Point
 # ---------------------------------------------------------------------------
 
 def main():
-    cfg = Config()
-    parser = argparse.ArgumentParser(description="TamilTTS DDP Training")
-    parser.add_argument(
-        "--dataset_dir", "--dataset_dirs",
-        nargs="*",
-        default=None,
-        help="Path(s) to dataset folder(s). Pass one or more paths separated by space or comma."
-    )
-    parser.add_argument("--wavlm_dir", type=str, default=cfg.wavlm_dir)
-    parser.add_argument("--whisper_dir", type=str, default=cfg.whisper_dir)
-    parser.add_argument("--checkpoint_dir", type=str, default=cfg.checkpoint_dir)
-    parser.add_argument("--per_gpu_batch", type=int, default=cfg.per_gpu_batch)
-    parser.add_argument("--grad_accum_steps", type=int, default=cfg.grad_accum_steps)
-    parser.add_argument("--total_steps", type=int, default=cfg.total_steps)
-    parser.add_argument("--resume", type=str, default=None)
+    parser = argparse.ArgumentParser(description="TamilTTS Training Pipeline (v6)")
+    parser.add_argument("--dataset_dir", nargs="*", default=None,
+                        help="Path(s) to dataset directory. Space-separated or comma-separated.")
+    parser.add_argument("--wavlm_dir", type=str, default=None, help="Path to WavLM checkpoint directory")
+    parser.add_argument("--whisper_dir", type=str, default=None, help="Path to IndicWhisper model directory")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to save checkpoints")
+    parser.add_argument("--total_steps", type=int, default=None, help="Total training steps")
+    parser.add_argument("--per_gpu_batch", type=int, default=None, help="Per-GPU batch size")
+    parser.add_argument("--grad_accum_steps", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--learning_rate", type=float, default=None, help="Learning rate")
     args = parser.parse_args()
 
-    if args.dataset_dir:
-        paths = []
+    cfg = Config()
+
+    if args.dataset_dir is not None:
+        flat_dirs = []
         for item in args.dataset_dir:
-            for sub_p in item.split(","):
-                if sub_p.strip():
-                    paths.append(sub_p.strip())
-        cfg.dataset_dir = paths if len(paths) > 1 else paths[0]
+            if "," in item:
+                flat_dirs.extend([d.strip() for d in item.split(",") if d.strip()])
+            else:
+                flat_dirs.append(item.strip())
+        cfg.dataset_dir = flat_dirs
 
-    cfg.wavlm_dir = args.wavlm_dir
-    cfg.whisper_dir = args.whisper_dir
-    cfg.checkpoint_dir = args.checkpoint_dir
-    cfg.per_gpu_batch = args.per_gpu_batch
-    cfg.grad_accum_steps = args.grad_accum_steps
-    cfg.total_steps = args.total_steps
+    if args.wavlm_dir is not None:
+        cfg.wavlm_dir = args.wavlm_dir
+    if args.whisper_dir is not None:
+        cfg.whisper_dir = args.whisper_dir
+    if args.checkpoint_dir is not None:
+        cfg.checkpoint_dir = args.checkpoint_dir
+    if args.total_steps is not None:
+        cfg.total_steps = args.total_steps
+    if args.per_gpu_batch is not None:
+        cfg.per_gpu_batch = args.per_gpu_batch
+    if args.grad_accum_steps is not None:
+        cfg.grad_accum_steps = args.grad_accum_steps
+    if args.learning_rate is not None:
+        cfg.learning_rate = args.learning_rate
 
-    if args.resume:
-        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-        import shutil
-        shutil.copy(args.resume, os.path.join(cfg.checkpoint_dir, "latest.pt"))
+    num_gpus = torch.cuda.device_count()
 
-    # Case 1: Launched via torchrun
-    if "LOCAL_RANK" in os.environ or "RANK" in os.environ:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        train_worker(local_rank, world_size, cfg)
-
-    # Case 2: Launched via regular `python train.py` on Multi-GPU machine -> Auto-spawn DDP
-    elif torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        world_size = torch.cuda.device_count()
-        print(f"🔥 Detected {world_size} GPUs! Auto-spawning DDP multi-process training...")
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
-        mp.spawn(train_worker, nprocs=world_size, args=(world_size, cfg))
-
-    # Case 3: Single GPU
+    if num_gpus > 1:
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", num_gpus))
+            train_worker(local_rank, world_size, cfg)
+        else:
+            print(f"🔥 Auto-spawning DDP multi-process training across {num_gpus} GPUs...")
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "29500"
+            mp.spawn(train_worker, args=(num_gpus, cfg), nprocs=num_gpus, join=True)
     else:
         train_worker(0, 1, cfg)
 

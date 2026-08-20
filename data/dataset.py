@@ -1,24 +1,26 @@
 import os
-import re
 import glob
-import torch
-import numpy as np
+import re
 import librosa
+import numpy as np
+import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from datasets import load_dataset
 from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
 
-# Initialize Tamil normalizer once (module-level, shared across all workers)
+# Initialize IndicNLP Tamil Normalizer once at module level
 _tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
 
-# Regex to normalize subscript digits (₀-₉) to standard digits (0-9)
+# Subscript digit mapping: ₀-₉ -> 0-9
 _SUBSCRIPT_MAP = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
 
 
 def normalize_tamil_text(text):
     """
-    Clean Tamil text using indic-nlp-library + custom rules.
-    This runs BEFORE character tokenization.
+    Complete Tamil text normalizer:
+      1. IndicNLP Unicode normalizer for Tamil (canonical glyphs, vowel matras)
+      2. Converts subscript digits (₀-₉) to standard ASCII digits (0-9)
+      3. Cleans duplicate whitespace
     """
     if not isinstance(text, str):
         return ""
@@ -28,56 +30,64 @@ def normalize_tamil_text(text):
     return text
 
 
+def build_tamil_vocab(max_vocab=256):
+    """
+    Build character-level vocabulary for Tamil TTS.
+    0: PAD, 1: SPACE, 2..: Tamil characters, digits, punctuation.
+    """
+    char2id = {" ": 1}
+    idx = 2
+    # Tamil Unicode block: 0x0B80 - 0x0BFF (128 code points)
+    for c in range(0x0B80, 0x0C00):
+        if idx < max_vocab:
+            char2id[chr(c)] = idx
+            idx += 1
+    # Digits 0-9
+    for d in "0123456789":
+        if idx < max_vocab:
+            char2id[d] = idx
+            idx += 1
+    # Common punctuation
+    for p in list(".,!?;:-'\"()"):
+        if idx < max_vocab:
+            char2id[p] = idx
+            idx += 1
+    return char2id, max_vocab
+
+
 class TamilTTSDataset(Dataset):
     """
-    Universal High-Fidelity Tamil TTS Dataset.
-    Supports:
-      - AI4Bharat Rasa (Studio Expressive TTS): ['text', 'audio', 'gender', 'style', 'duration']
-      - AI4Bharat IndicVoices-R (Clean Read Speech): ['normalized', 'text', 'audio', 'verbatim']
-      - AI4Bharat Shrutilipi: ['text', 'audio_filepath']
+    Universal dataset loader for Tamil TTS.
+    Supports Rasa, IndicVoices-R, and Shrutilipi datasets seamlessly.
     """
-    def __init__(self, hf_dataset, max_audio_len=48000, max_text_len=200,
-                 mel_channels=80, n_fft=1024, hop_length=256, sr=16000):
+    def __init__(self, hf_dataset, cfg):
         self.ds = hf_dataset
-        self.max_audio_len = max_audio_len
-        self.max_text_len  = max_text_len
-        self.mel_channels  = mel_channels
-        self.n_fft         = n_fft
-        self.hop_length    = hop_length
-        self.sr            = sr
-        self.max_mel_len   = max_audio_len // hop_length  # 188
+        self.sr = cfg.sample_rate
+        self.max_audio_len = cfg.max_audio_len
+        self.max_text_len = cfg.max_text_len
+        self.max_mel_len = cfg.max_mel_len
+        self.n_fft = cfg.n_fft
+        self.hop_length = cfg.hop_length
+        self.mel_channels = cfg.mel_channels
 
-        # Tamil Unicode character vocabulary (0x0B80-0x0BFF)
-        self.char2id = {" ": 1}  # 0=PAD, 1=SPACE
-        idx = 2
-        for c in range(0x0B80, 0x0C00):
-            self.char2id[chr(c)] = idx
-            idx += 1
-        # Digits (after normalizer converts subscripts)
-        for d in "0123456789":
-            self.char2id[d] = idx
-            idx += 1
-        # Common punctuation (important for prosody & pauses)
-        for p in list(".,!?;:-'\""):
-            self.char2id[p] = idx
-            idx += 1
-        self.vocab_size = idx
+        self.char2id, self.vocab_size = build_tamil_vocab(max_vocab=getattr(cfg, "vocab_size", 256))
 
     def __len__(self):
         return len(self.ds)
 
     def text_to_ids(self, text):
-        """Normalize with indic-nlp, then map each character to an ID."""
+        """Normalize Tamil text and convert to token IDs."""
         text = normalize_tamil_text(text)
         ids = [self.char2id.get(ch, 0) for ch in text]
+        ids = [min(i, self.vocab_size - 1) for i in ids]
         ids = ids[:self.max_text_len]
         ids += [0] * (self.max_text_len - len(ids))
         return ids
 
     def __getitem__(self, idx):
         """
-        Extract normalized text, raw audio, and compute mel-spectrogram.
-        If a sample is corrupted, seamlessly skip to the next index.
+        Extracts normalized text, raw audio, and normalized mel spectrogram.
+        Pads mel spectrogram with SILENCE (-1.0) rather than loud noise.
         """
         total = len(self)
         for offset in range(total):
@@ -85,7 +95,7 @@ class TamilTTSDataset(Dataset):
             try:
                 sample = self.ds[actual_idx]
 
-                # --- 1. Extract Text (Supports Rasa, IndicVoices-R, Shrutilipi) ---
+                # 1. Extract Text
                 text = (
                     sample.get("normalized")
                     or sample.get("text")
@@ -97,7 +107,7 @@ class TamilTTSDataset(Dataset):
 
                 token_ids = torch.tensor(self.text_to_ids(text), dtype=torch.long)
 
-                # --- 2. Extract Audio (Supports audio dict, AudioDecoder, audio_filepath) ---
+                # 2. Extract Audio
                 audio_data = sample.get("audio") or sample.get("audio_filepath")
                 if audio_data is None:
                     continue
@@ -105,10 +115,10 @@ class TamilTTSDataset(Dataset):
                 if isinstance(audio_data, dict):
                     audio_array = np.array(audio_data["array"], dtype=np.float32)
                     sr = audio_data.get("sampling_rate", self.sr)
-                elif hasattr(audio_data, "get_all_samples"):  # AudioDecoder object
+                elif hasattr(audio_data, "get_all_samples"):
                     audio_array = np.array(audio_data["array"], dtype=np.float32)
                     sr = getattr(audio_data, "sampling_rate", self.sr)
-                elif isinstance(audio_data, str):  # file path string
+                elif isinstance(audio_data, str):
                     audio_array, sr = librosa.load(audio_data, sr=self.sr)
                 else:
                     audio_array = np.array(audio_data, dtype=np.float32)
@@ -118,37 +128,48 @@ class TamilTTSDataset(Dataset):
                 if sr != self.sr:
                     audio_array = librosa.resample(y=audio_array, orig_sr=sr, target_sr=self.sr)
 
-                # Skip extremely short audio (< 0.1s)
-                if len(audio_array) < 1600:
+                # Skip extremely short clips (< 0.2s)
+                if len(audio_array) < 3200:
                     continue
 
-                # Pad or truncate raw waveform
-                if len(audio_array) > self.max_audio_len:
-                    audio_array = audio_array[:self.max_audio_len]
-                else:
-                    audio_array = np.pad(audio_array, (0, self.max_audio_len - len(audio_array)))
-
-                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
-
-                # --- 3. Mel Spectrogram ---
+                # Compute Mel on clean unpadded audio first
                 mel = librosa.feature.melspectrogram(
                     y=audio_array, sr=self.sr, n_fft=self.n_fft,
                     hop_length=self.hop_length, n_mels=self.mel_channels,
                 )
-                mel_db = librosa.power_to_db(mel, ref=np.max)
+                mel_db = librosa.power_to_db(mel, ref=np.max)  # [-80.0, 0.0]
 
-                # Pad or truncate mel to fixed length (188 frames)
-                if mel_db.shape[1] > self.max_mel_len:
-                    mel_db = mel_db[:, :self.max_mel_len]
+                # Normalize to [-1.0, 1.0] where -1.0 is silence and +1.0 is max loud
+                mel_norm = np.clip((mel_db + 80.0) / 40.0 - 1.0, -1.0, 1.0)
+
+                # Pad or truncate Mel Spectrogram with SILENCE (-1.0)
+                if mel_norm.shape[1] > self.max_mel_len:
+                    mel_norm = mel_norm[:, :self.max_mel_len]
                 else:
-                    mel_db = np.pad(mel_db, ((0, 0), (0, self.max_mel_len - mel_db.shape[1])))
+                    mel_norm = np.pad(
+                        mel_norm,
+                        ((0, 0), (0, self.max_mel_len - mel_norm.shape[1])),
+                        mode="constant",
+                        constant_values=-1.0,  # CRITICAL: -1.0 is SILENCE (not 0.0 dB noise)
+                    )
 
-                mel_tensor = torch.tensor(mel_db, dtype=torch.float32)  # [80, max_mel_len]
+                # Pad or truncate raw audio with SILENCE (0.0)
+                if len(audio_array) > self.max_audio_len:
+                    audio_array = audio_array[:self.max_audio_len]
+                else:
+                    audio_array = np.pad(
+                        audio_array,
+                        (0, self.max_audio_len - len(audio_array)),
+                        mode="constant",
+                        constant_values=0.0,
+                    )
+
+                mel_tensor = torch.tensor(mel_norm, dtype=torch.float32)    # [80, max_mel_len]
+                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)  # [max_audio_len]
 
                 return token_ids, mel_tensor, audio_tensor
 
             except Exception:
-                # Corrupted sample, skip to next index
                 continue
 
         raise RuntimeError(f"Could not find any valid sample starting from index {idx}")
@@ -159,15 +180,14 @@ ShrutilipiDataset = TamilTTSDataset
 
 
 def resolve_dataset_path(path):
-    """Auto-resolve Kaggle input path variations."""
+    """Auto-resolve Kaggle dataset folder path variations."""
     if not isinstance(path, str):
         return path
     search_paths = [
         path,
-        path.replace("/datasets/ragunathravi/", "/"),
-        f"/kaggle/input/{os.path.basename(path)}",
-        f"/kaggle/input/datasets/ragunathravi/{os.path.basename(path)}",
-        f"/kaggle/input/{path}",
+        os.path.join(path, "data"),
+        os.path.join("/kaggle/input", os.path.basename(path)),
+        os.path.join("/kaggle/input/datasets", os.path.basename(path)),
     ]
     for p in search_paths:
         if os.path.exists(p):
@@ -175,119 +195,110 @@ def resolve_dataset_path(path):
     return path
 
 
-def load_single_dataset_splits(dataset_path, val_split=0.05):
-    """
-    Loads train and test splits for a single dataset path.
-    Supports:
-      - Rasa (train.parquet / test.parquet)
-      - IndicVoices-R (train-*.parquet / test-*.parquet)
-      - Sharded parquet directory
-      - Single parquet file
-    """
-    resolved_path = resolve_dataset_path(dataset_path)
+def load_single_dataset_splits(data_path):
+    """Loads train and validation/test splits from a dataset path."""
+    resolved_path = resolve_dataset_path(data_path)
+    print(f"  Loading dataset from: {resolved_path}")
 
-    # 1. Check for explicit train-*.parquet and test-*.parquet files (IndicVoices-R & Rasa)
-    if os.path.isdir(resolved_path):
-        train_files = sorted(glob.glob(os.path.join(resolved_path, "*train*.parquet")))
-        test_files  = sorted(glob.glob(os.path.join(resolved_path, "*test*.parquet")))
+    train_files = sorted(
+        glob.glob(os.path.join(resolved_path, "*train*.parquet"))
+        + glob.glob(os.path.join(resolved_path, "**", "*train*.parquet"), recursive=True)
+    )
+    test_files = sorted(
+        glob.glob(os.path.join(resolved_path, "*test*.parquet"))
+        + glob.glob(os.path.join(resolved_path, "**", "*test*.parquet"), recursive=True)
+    )
 
-        if train_files:
-            print(f"  ✓ Found {len(train_files)} train parquet file(s) in {resolved_path}")
-            train_ds = load_dataset("parquet", data_files={"train": train_files})["train"]
-            if test_files:
-                print(f"  ✓ Found {len(test_files)} test parquet file(s) in {resolved_path}")
-                val_ds = load_dataset("parquet", data_files={"test": test_files})["test"]
-            else:
-                split = train_ds.train_test_split(test_size=val_split, seed=42)
-                train_ds, val_ds = split["train"], split["test"]
-            return train_ds, val_ds
+    if train_files:
+        print(f"    Found {len(train_files)} train parquet files")
+        train_ds = load_dataset("parquet", data_files=train_files, split="train")
+        if test_files:
+            print(f"    Found {len(test_files)} test/val parquet files")
+            val_ds = load_dataset("parquet", data_files=test_files, split="train")
+        else:
+            split_ds = train_ds.train_test_split(test_size=0.02, seed=42)
+            train_ds, val_ds = split_ds["train"], split_ds["test"]
+        return train_ds, val_ds
 
-        # Shards without train/test in filename
-        all_parquets = sorted(glob.glob(os.path.join(resolved_path, "*.parquet")))
-        if all_parquets:
-            print(f"  ✓ Found {len(all_parquets)} parquet file(s) in {resolved_path}")
-            full_ds = load_dataset("parquet", data_files={"train": all_parquets})["train"]
-            split = full_ds.train_test_split(test_size=val_split, seed=42)
-            return split["train"], split["test"]
+    all_parquets = sorted(
+        glob.glob(os.path.join(resolved_path, "*.parquet"))
+        + glob.glob(os.path.join(resolved_path, "**", "*.parquet"), recursive=True)
+    )
+    if all_parquets:
+        print(f"    Found {len(all_parquets)} generic parquet files")
+        full_ds = load_dataset("parquet", data_files=all_parquets, split="train")
+        split_ds = full_ds.train_test_split(test_size=0.02, seed=42)
+        return split_ds["train"], split_ds["test"]
 
-    # 2. Single Parquet file
-    if os.path.isfile(resolved_path):
-        print(f"  ✓ Loading single parquet file: {resolved_path}")
-        full_ds = load_dataset("parquet", data_files={"train": resolved_path})["train"]
-        split = full_ds.train_test_split(test_size=val_split, seed=42)
-        return split["train"], split["test"]
-
-    raise FileNotFoundError(f"Could not locate valid parquet files at: {dataset_path} (resolved: {resolved_path})")
+    full_ds = load_dataset("parquet", data_dir=resolved_path, split="train")
+    split_ds = full_ds.train_test_split(test_size=0.02, seed=42)
+    return split_ds["train"], split_ds["test"]
 
 
 def build_tamil_datasets(dataset_dirs, cfg):
     """
-    Builds and combines datasets from one or multiple paths.
-    Returns: (train_dataset, val_dataset) as PyTorch Datasets.
+    Builds combined Tamil TTS datasets from one or multiple dataset directories.
     """
-    # Parse multiple comma-separated paths if provided
     if isinstance(dataset_dirs, str):
-        paths = [p.strip() for p in dataset_dirs.split(",") if p.strip()]
+        if "," in dataset_dirs:
+            dirs = [d.strip() for d in dataset_dirs.split(",") if d.strip()]
+        else:
+            dirs = [dataset_dirs]
     elif isinstance(dataset_dirs, (list, tuple)):
-        paths = list(dataset_dirs)
+        dirs = list(dataset_dirs)
     else:
-        paths = [str(dataset_dirs)]
+        dirs = [str(dataset_dirs)]
 
-    train_datasets = []
-    val_datasets = []
+    train_splits = []
+    val_splits = []
 
+    print("\n" + "=" * 60)
+    print("  TamilTTS Dataset Builder (Combined Sources)")
     print("=" * 60)
-    print(f"  Loading & Combining {len(paths)} Tamil Dataset Source(s)...")
-    print("=" * 60)
 
-    for p in paths:
+    for d in dirs:
         try:
-            train_raw, val_raw = load_single_dataset_splits(p, val_split=cfg.val_split)
-            print(f"    --> Source: {os.path.basename(p)} | Train: {len(train_raw):,} | Val: {len(val_raw):,}")
-
-            train_ds = TamilTTSDataset(
-                train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-                mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-            )
-            val_ds = TamilTTSDataset(
-                val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-                mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-            )
-            train_datasets.append(train_ds)
-            val_datasets.append(val_ds)
+            train_hf, val_hf = load_single_dataset_splits(d)
+            print(f"    Loaded: {len(train_hf)} train, {len(val_hf)} val samples from '{d}'")
+            train_splits.append(TamilTTSDataset(train_hf, cfg))
+            val_splits.append(TamilTTSDataset(val_hf, cfg))
         except Exception as e:
-            print(f"    ⚠️ Warning: Could not load dataset at '{p}': {e}")
+            print(f"    ⚠️ Warning: Could not load dataset from '{d}': {e}")
 
-    if not train_datasets:
-        raise RuntimeError("No valid Tamil datasets could be loaded! Please check dataset paths.")
+    if not train_splits:
+        raise RuntimeError(f"No valid datasets could be loaded from: {dirs}")
 
-    # Combine datasets
-    if len(train_datasets) > 1:
-        final_train_ds = ConcatDataset(train_datasets)
-        final_val_ds   = ConcatDataset(val_datasets)
+    if len(train_splits) == 1:
+        final_train = train_splits[0]
+        final_val = val_splits[0]
     else:
-        final_train_ds = train_datasets[0]
-        final_val_ds   = val_datasets[0]
+        final_train = ConcatDataset(train_splits)
+        final_val = ConcatDataset(val_splits)
 
-    print(f"\n  🎉 Combined Dataset Total:")
-    print(f"     • Total Train Samples: {len(final_train_ds):,}")
-    print(f"     • Total Val Samples  : {len(final_val_ds):,}")
-    print(f"     • Grand Total Audio  : {len(final_train_ds) + len(final_val_ds):,} studio samples (~75k+)")
-    print("=" * 60)
+    print(f"\n  ✅ Combined Total Training Samples   : {len(final_train):,}")
+    print(f"  ✅ Combined Total Validation Samples : {len(final_val):,}")
+    print("=" * 60 + "\n")
 
-    return final_train_ds, final_val_ds
+    return final_train, final_val
 
 
 def build_dataloaders(cfg):
-    """Build train and validation DataLoaders (supports multi-dataset combination)."""
+    """Builds PyTorch DataLoaders for train and validation."""
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
-
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size if hasattr(cfg, 'batch_size') else cfg.per_gpu_batch,
-        shuffle=True, num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+        train_ds,
+        batch_size=cfg.per_gpu_batch,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size if hasattr(cfg, 'batch_size') else cfg.per_gpu_batch,
-        shuffle=False, num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
+        val_ds,
+        batch_size=cfg.per_gpu_batch,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
     )
     return train_loader, val_loader
