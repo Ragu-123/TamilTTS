@@ -11,6 +11,7 @@ TamilTTS Training Script — v6 (Auto-DDP Multi-GPU with HiFi-GAN & Alignment Fi
 import argparse
 import os
 import sys
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +28,6 @@ from models import TamilTTS
 from losses import SLMLoss, SRFDLoss
 from data import build_tamil_datasets, build_dataloaders
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
-from datasets import load_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,6 @@ def train_worker(local_rank, world_size, cfg):
     whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
     srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext)
     del whisper_model
-    import gc
     gc.collect()
 
     # 5. Dataset & Distributed Samplers
@@ -199,108 +198,107 @@ def train_worker(local_rank, world_size, cfg):
     if os.path.exists(resume_path):
         global_step = load_checkpoint(resume_path, model, optimizer, scheduler)
 
-    import gc
     gc.collect()
     torch.cuda.empty_cache()
 
     # 7. Training Loop
     try:
         model.train()
-    for epoch in range(total_epochs):
-        if global_step >= cfg.total_steps:
-            break
-
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        pbar = tqdm(
-            enumerate(train_loader), total=batches_per_gpu,
-            desc=f"Epoch {epoch+1}/{total_epochs}", unit="batch", ncols=140,
-            disable=not is_main_process(local_rank),
-        )
-
-        optimizer.zero_grad()
-
-        for batch_idx, (text_tokens, ref_mel, real_audio) in pbar:
+        for epoch in range(total_epochs):
             if global_step >= cfg.total_steps:
                 break
 
-            text_tokens = text_tokens.to(device)
-            ref_mel     = ref_mel.to(device)
-            real_audio  = real_audio.to(device)
-            target_mel_len = ref_mel.size(2)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-            # Mask padding text tokens (0 is PAD)
-            text_mask = (text_tokens == 0)
-            non_pad = (~text_mask).float()
-            text_lens = non_pad.sum(dim=1, keepdim=True).clamp(min=1)
-            target_dur = non_pad * (target_mel_len / text_lens)
-
-            # Forward pass: Uses target_dur during training for rock-solid phoneme alignment!
-            gen_audio, mel_pred, dur_pred = model(
-                text_tokens, ref_mel,
-                target_mel_len=target_mel_len,
-                text_mask=text_mask,
-                target_dur=target_dur,
+            pbar = tqdm(
+                enumerate(train_loader), total=batches_per_gpu,
+                desc=f"Epoch {epoch+1}/{total_epochs}", unit="batch", ncols=140,
+                disable=not is_main_process(local_rank),
             )
 
-            # --- Losses ---
-            mel_target = ref_mel.transpose(1, 2)
-            loss_mel = F.l1_loss(mel_pred, mel_target)
+            optimizer.zero_grad()
 
-            min_a = min(gen_audio.size(1), real_audio.size(1))
-            loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
+            for batch_idx, (text_tokens, ref_mel, real_audio) in pbar:
+                if global_step >= cfg.total_steps:
+                    break
 
-            loss_dur = F.huber_loss(dur_pred, target_dur, delta=1.0)
+                text_tokens = text_tokens.to(device)
+                ref_mel     = ref_mel.to(device)
+                real_audio  = real_audio.to(device)
+                target_mel_len = ref_mel.size(2)
 
-            total_loss = (
-                cfg.weight_mel * loss_mel
-                + cfg.weight_slm * loss_slm
-                + cfg.weight_dur * loss_dur
-            )
+                # Mask padding text tokens (0 is PAD)
+                text_mask = (text_tokens == 0)
+                non_pad = (~text_mask).float()
+                text_lens = non_pad.sum(dim=1, keepdim=True).clamp(min=1)
+                target_dur = non_pad * (target_mel_len / text_lens)
 
-            scaled_loss = total_loss / cfg.grad_accum_steps
-            scaled_loss.backward()
+                # Forward pass: Uses target_dur during training for rock-solid phoneme alignment!
+                gen_audio, mel_pred, dur_pred = model(
+                    text_tokens, ref_mel,
+                    target_mel_len=target_mel_len,
+                    text_mask=text_mask,
+                    target_dur=target_dur,
+                )
 
-            # Optimizer Step on Accumulation
-            if (batch_idx + 1) % cfg.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+                # --- Losses ---
+                mel_target = ref_mel.transpose(1, 2)
+                loss_mel = F.l1_loss(mel_pred, mel_target)
 
-                if is_main_process(local_rank):
-                    pbar.set_postfix({
-                        "step": global_step,
-                        "loss": f"{total_loss.item():.3f}",
-                        "mel": f"{loss_mel.item():.3f}",
-                        "slm": f"{loss_slm.item():.3f}",
-                        "dur": f"{loss_dur.item():.3f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.1e}",
-                    })
+                min_a = min(gen_audio.size(1), real_audio.size(1))
+                loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
-                # Checkpoint (Rank 0 only)
-                if is_main_process(local_rank) and global_step % cfg.save_every == 0:
-                    save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
-                                    os.path.join(cfg.checkpoint_dir, "latest.pt"))
-                    save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
-                                    os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"))
-                    print(f"\n  [Checkpoint] Saved at step {global_step}")
+                loss_dur = F.huber_loss(dur_pred, target_dur, delta=1.0)
 
-                # Validation (Rank 0 only)
-                val_freq = getattr(cfg, "val_every", 2000)
-                if is_main_process(local_rank) and global_step % val_freq == 0:
-                    val_mel, val_srfd = validate(model, val_loader, srfd_loss_fn, device, global_step)
-                    print(f"\n  [Val @ step {global_step}] Mel L1: {val_mel:.4f} | SR-FD: {val_srfd:.4f}")
-                    if val_mel < best_val_loss:
-                        best_val_loss = val_mel
-                        save_checkpoint(model, optimizer, scheduler, global_step, val_mel,
-                                        os.path.join(cfg.checkpoint_dir, "best.pt"))
-                        print(f"  [Val] New best model saved! (Mel L1: {val_mel:.4f})")
+                total_loss = (
+                    cfg.weight_mel * loss_mel
+                    + cfg.weight_slm * loss_slm
+                    + cfg.weight_dur * loss_dur
+                )
 
-                if is_distributed:
-                    dist.barrier()
+                scaled_loss = total_loss / cfg.grad_accum_steps
+                scaled_loss.backward()
+
+                # Optimizer Step on Accumulation
+                if (batch_idx + 1) % cfg.grad_accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                    if is_main_process(local_rank):
+                        pbar.set_postfix({
+                            "step": global_step,
+                            "loss": f"{total_loss.item():.3f}",
+                            "mel": f"{loss_mel.item():.3f}",
+                            "slm": f"{loss_slm.item():.3f}",
+                            "dur": f"{loss_dur.item():.3f}",
+                            "lr": f"{scheduler.get_last_lr()[0]:.1e}",
+                        })
+
+                    # Checkpoint (Rank 0 only)
+                    if is_main_process(local_rank) and global_step % cfg.save_every == 0:
+                        save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
+                                        os.path.join(cfg.checkpoint_dir, "latest.pt"))
+                        save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
+                                        os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"))
+                        print(f"\n  [Checkpoint] Saved at step {global_step}")
+
+                    # Validation (Rank 0 only)
+                    val_freq = getattr(cfg, "val_every", 2000)
+                    if is_main_process(local_rank) and global_step % val_freq == 0:
+                        val_mel, val_srfd = validate(model, val_loader, srfd_loss_fn, device, global_step)
+                        print(f"\n  [Val @ step {global_step}] Mel L1: {val_mel:.4f} | SR-FD: {val_srfd:.4f}")
+                        if val_mel < best_val_loss:
+                            best_val_loss = val_mel
+                            save_checkpoint(model, optimizer, scheduler, global_step, val_mel,
+                                            os.path.join(cfg.checkpoint_dir, "best.pt"))
+                            print(f"  [Val] New best model saved! (Mel L1: {val_mel:.4f})")
+
+                    if is_distributed:
+                        dist.barrier()
 
         if is_main_process(local_rank):
             save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
