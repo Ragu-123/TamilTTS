@@ -305,25 +305,25 @@ def train_worker(local_rank, world_size, cfg):
 # ---------------------------------------------------------------------------
 
 def main():
+    cfg = Config()
     parser = argparse.ArgumentParser(description="TamilTTS DDP Training")
-    parser.add_argument("--dataset_dir", type=str, default=None)
-    parser.add_argument("--wavlm_dir", type=str, default=None)
-    parser.add_argument("--whisper_dir", type=str, default=None)
-    parser.add_argument("--checkpoint_dir", type=str, default=None)
-    parser.add_argument("--per_gpu_batch", type=int, default=None)
-    parser.add_argument("--grad_accum_steps", type=int, default=None)
-    parser.add_argument("--total_steps", type=int, default=None)
+    parser.add_argument("--dataset_dir", type=str, default=cfg.dataset_dir)
+    parser.add_argument("--wavlm_dir", type=str, default=cfg.wavlm_dir)
+    parser.add_argument("--whisper_dir", type=str, default=cfg.whisper_dir)
+    parser.add_argument("--checkpoint_dir", type=str, default=cfg.checkpoint_dir)
+    parser.add_argument("--per_gpu_batch", type=int, default=cfg.per_gpu_batch)
+    parser.add_argument("--grad_accum_steps", type=int, default=cfg.grad_accum_steps)
+    parser.add_argument("--total_steps", type=int, default=cfg.total_steps)
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
 
-    cfg = Config()
-    if args.dataset_dir:      cfg.dataset_dir = args.dataset_dir
-    if args.wavlm_dir:        cfg.wavlm_dir = args.wavlm_dir
-    if args.whisper_dir:      cfg.whisper_dir = args.whisper_dir
-    if args.checkpoint_dir:   cfg.checkpoint_dir = args.checkpoint_dir
-    if args.per_gpu_batch:    cfg.per_gpu_batch = args.per_gpu_batch
-    if args.grad_accum_steps: cfg.grad_accum_steps = args.grad_accum_steps
-    if args.total_steps:      cfg.total_steps = args.total_steps
+    cfg.dataset_dir = args.dataset_dir
+    cfg.wavlm_dir = args.wavlm_dir
+    cfg.whisper_dir = args.whisper_dir
+    cfg.checkpoint_dir = args.checkpoint_dir
+    cfg.per_gpu_batch = args.per_gpu_batch
+    cfg.grad_accum_steps = args.grad_accum_steps
+    cfg.total_steps = args.total_steps
 
     if args.resume:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
