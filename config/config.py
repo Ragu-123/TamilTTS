@@ -1,8 +1,11 @@
 """TamilTTS Configuration — Locked 68.55M architecture."""
 
 class Config:
-    # --- Paths (Supports comma-separated datasets for multi-dataset combination) ---
-    dataset_dir    = "/kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil,/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil"
+    # --- Paths (Supports single path or list of paths for multi-dataset combination) ---
+    dataset_dir = [
+        "/kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil",
+        "/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil",
+    ]
     wavlm_dir      = "/kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1"
     whisper_dir    = "/kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu"
     checkpoint_dir = "./checkpoints"

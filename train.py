@@ -293,7 +293,12 @@ def train_worker(local_rank, world_size, cfg):
 def main():
     cfg = Config()
     parser = argparse.ArgumentParser(description="TamilTTS DDP Training")
-    parser.add_argument("--dataset_dir", type=str, default=cfg.dataset_dir)
+    parser.add_argument(
+        "--dataset_dir", "--dataset_dirs",
+        nargs="*",
+        default=None,
+        help="Path(s) to dataset folder(s). Pass one or more paths separated by space or comma."
+    )
     parser.add_argument("--wavlm_dir", type=str, default=cfg.wavlm_dir)
     parser.add_argument("--whisper_dir", type=str, default=cfg.whisper_dir)
     parser.add_argument("--checkpoint_dir", type=str, default=cfg.checkpoint_dir)
@@ -303,7 +308,14 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
 
-    cfg.dataset_dir = args.dataset_dir
+    if args.dataset_dir:
+        paths = []
+        for item in args.dataset_dir:
+            for sub_p in item.split(","):
+                if sub_p.strip():
+                    paths.append(sub_p.strip())
+        cfg.dataset_dir = paths if len(paths) > 1 else paths[0]
+
     cfg.wavlm_dir = args.wavlm_dir
     cfg.whisper_dir = args.whisper_dir
     cfg.checkpoint_dir = args.checkpoint_dir
