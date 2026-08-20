@@ -59,6 +59,7 @@ class TamilTTSDataset(Dataset):
     """
     Universal dataset loader for Tamil TTS.
     Supports Rasa, IndicVoices-R, and Shrutilipi datasets seamlessly.
+    Processes audio on-the-fly via multi-process DataLoaders.
     """
     def __init__(self, hf_dataset, cfg):
         self.ds = hf_dataset
@@ -150,7 +151,7 @@ class TamilTTSDataset(Dataset):
                         mel_norm,
                         ((0, 0), (0, self.max_mel_len - mel_norm.shape[1])),
                         mode="constant",
-                        constant_values=-1.0,  # CRITICAL: -1.0 is SILENCE (not 0.0 dB noise)
+                        constant_values=-1.0,  # CRITICAL: -1.0 is SILENCE
                     )
 
                 # Pad or truncate raw audio with SILENCE (0.0)
@@ -195,10 +196,15 @@ def resolve_dataset_path(path):
     return path
 
 
-def load_single_dataset_splits(data_path):
-    """Loads train and validation/test splits from a dataset path."""
+def load_single_dataset_splits(data_path, num_proc=None):
+    """
+    Loads train and validation/test splits from a dataset path using multi-processing.
+    """
+    if num_proc is None:
+        num_proc = min(os.cpu_count() or 4, 8)
+
     resolved_path = resolve_dataset_path(data_path)
-    print(f"  Loading dataset from: {resolved_path}")
+    print(f"  Loading dataset from: {resolved_path} (using {num_proc} CPU workers)")
 
     train_files = sorted(
         glob.glob(os.path.join(resolved_path, "*train*.parquet"))
@@ -211,10 +217,10 @@ def load_single_dataset_splits(data_path):
 
     if train_files:
         print(f"    Found {len(train_files)} train parquet files")
-        train_ds = load_dataset("parquet", data_files=train_files, split="train")
+        train_ds = load_dataset("parquet", data_files=train_files, split="train", num_proc=num_proc)
         if test_files:
             print(f"    Found {len(test_files)} test/val parquet files")
-            val_ds = load_dataset("parquet", data_files=test_files, split="train")
+            val_ds = load_dataset("parquet", data_files=test_files, split="train", num_proc=num_proc)
         else:
             split_ds = train_ds.train_test_split(test_size=0.02, seed=42)
             train_ds, val_ds = split_ds["train"], split_ds["test"]
@@ -226,19 +232,22 @@ def load_single_dataset_splits(data_path):
     )
     if all_parquets:
         print(f"    Found {len(all_parquets)} generic parquet files")
-        full_ds = load_dataset("parquet", data_files=all_parquets, split="train")
+        full_ds = load_dataset("parquet", data_files=all_parquets, split="train", num_proc=num_proc)
         split_ds = full_ds.train_test_split(test_size=0.02, seed=42)
         return split_ds["train"], split_ds["test"]
 
-    full_ds = load_dataset("parquet", data_dir=resolved_path, split="train")
+    full_ds = load_dataset("parquet", data_dir=resolved_path, split="train", num_proc=num_proc)
     split_ds = full_ds.train_test_split(test_size=0.02, seed=42)
     return split_ds["train"], split_ds["test"]
 
 
-def build_tamil_datasets(dataset_dirs, cfg):
+def build_tamil_datasets(dataset_dirs, cfg, num_proc=None):
     """
-    Builds combined Tamil TTS datasets from one or multiple dataset directories.
+    Builds combined Tamil TTS datasets with multi-core parallel parquet loading.
     """
+    if num_proc is None:
+        num_proc = min(os.cpu_count() or 4, 8)
+
     if isinstance(dataset_dirs, str):
         if "," in dataset_dirs:
             dirs = [d.strip() for d in dataset_dirs.split(",") if d.strip()]
@@ -253,13 +262,13 @@ def build_tamil_datasets(dataset_dirs, cfg):
     val_splits = []
 
     print("\n" + "=" * 60)
-    print("  TamilTTS Dataset Builder (Combined Sources)")
+    print(f"  TamilTTS Fast Multi-Core Dataset Builder ({num_proc} CPU processes)")
     print("=" * 60)
 
     for d in dirs:
         try:
-            train_hf, val_hf = load_single_dataset_splits(d)
-            print(f"    Loaded: {len(train_hf)} train, {len(val_hf)} val samples from '{d}'")
+            train_hf, val_hf = load_single_dataset_splits(d, num_proc=num_proc)
+            print(f"    ✓ Loaded: {len(train_hf):,} train, {len(val_hf):,} val samples from '{d}'")
             train_splits.append(TamilTTSDataset(train_hf, cfg))
             val_splits.append(TamilTTSDataset(val_hf, cfg))
         except Exception as e:
@@ -275,15 +284,16 @@ def build_tamil_datasets(dataset_dirs, cfg):
         final_train = ConcatDataset(train_splits)
         final_val = ConcatDataset(val_splits)
 
-    print(f"\n  ✅ Combined Total Training Samples   : {len(final_train):,}")
-    print(f"  ✅ Combined Total Validation Samples : {len(final_val):,}")
+    print(f"\n  🎉 Combined Dataset Ready:")
+    print(f"  • Total Train Samples: {len(final_train):,}")
+    print(f"  • Total Val Samples  : {len(final_val):,}")
     print("=" * 60 + "\n")
 
     return final_train, final_val
 
 
 def build_dataloaders(cfg):
-    """Builds PyTorch DataLoaders for train and validation."""
+    """Builds PyTorch DataLoaders with persistent multi-processing workers."""
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
     train_loader = DataLoader(
         train_ds,
@@ -291,6 +301,8 @@ def build_dataloaders(cfg):
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=True,
+        persistent_workers=(cfg.num_workers > 0),
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -299,6 +311,8 @@ def build_dataloaders(cfg):
         shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=True,
+        persistent_workers=(cfg.num_workers > 0),
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
         drop_last=False,
     )
     return train_loader, val_loader
