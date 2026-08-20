@@ -26,16 +26,18 @@ class Config:
     max_text_len  = 200
     max_mel_len   = 188     # max_audio_len / hop_length
 
-    # --- Training ---
-    total_steps  = 300_000
-    batch_size   = 32
-    num_workers  = 4
-    learning_rate = 1e-4
-    warmup_steps = 10_000
-    save_every   = 5000
-    val_every    = 2000
-    log_every    = 10
-    val_split    = 0.05
+    # --- Training (DDP + Gradient Accumulation) ---
+    total_steps      = 300_000
+    per_gpu_batch    = 8        # Per-GPU batch size (fits in ~10 GB VRAM)
+    grad_accum_steps = 4        # Accumulate 4 micro-batches before optimizer step
+    # Effective batch = per_gpu_batch(8) * num_gpus(4) * grad_accum(4) = 128
+    num_workers    = 4
+    learning_rate  = 1e-4
+    warmup_steps   = 10_000
+    save_every     = 5000
+    val_every      = 2000
+    log_every      = 10
+    val_split      = 0.05
 
     # --- Loss Weights ---
     weight_mel   = 45.0
