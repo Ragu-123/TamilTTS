@@ -34,7 +34,7 @@ class Config:
     per_gpu_batch    = 8        # Per-GPU batch size (fits comfortably in 10-16 GB VRAM)
     grad_accum_steps = 4        # Accumulate 4 micro-batches
     # Effective batch = per_gpu_batch(8) * num_gpus(4) * grad_accum(4) = 128
-    num_workers      = 0
+    num_workers      = 4
     learning_rate    = 1e-4
     warmup_steps     = 2_000
     save_every       = 2_000

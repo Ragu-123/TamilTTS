@@ -157,6 +157,7 @@ def train_worker(local_rank, world_size, cfg):
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
 
+    use_workers = cfg.num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.per_gpu_batch,
@@ -164,6 +165,8 @@ def train_worker(local_rank, world_size, cfg):
         sampler=train_sampler,
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=use_workers,
+        prefetch_factor=2 if use_workers else None,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -173,6 +176,8 @@ def train_worker(local_rank, world_size, cfg):
         sampler=val_sampler,
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=use_workers,
+        prefetch_factor=2 if use_workers else None,
         drop_last=False,
     )
 
