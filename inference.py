@@ -34,76 +34,86 @@ def normalize_tamil_text(text):
     return text
 
 
-def build_char2id():
-    """Build the exact same character vocabulary used during training."""
+def build_char2id(max_vocab_size=128):
+    """
+    Build character vocabulary with strict index bounding to prevent CUDA out-of-bounds.
+    """
     char2id = {" ": 1}  # 0=PAD, 1=SPACE
     idx = 2
+    # Tamil Unicode block (0x0B80 - 0x0BFF)
     for c in range(0x0B80, 0x0C00):
-        char2id[chr(c)] = idx
-        idx += 1
+        if idx < max_vocab_size:
+            char2id[chr(c)] = idx
+            idx += 1
+    # Digits
     for d in "0123456789":
-        char2id[d] = idx
-        idx += 1
+        if idx < max_vocab_size:
+            char2id[d] = idx
+            idx += 1
+    # Punctuation
     for p in list(".,!?;:-'\""):
-        char2id[p] = idx
-        idx += 1
+        if idx < max_vocab_size:
+            char2id[p] = idx
+            idx += 1
     return char2id
 
 
-def text_to_ids(text, char2id, max_text_len=200):
-    """Convert Tamil text to token IDs (identical to training tokenization)."""
+def text_to_ids(text, char2id, max_text_len=200, max_vocab_size=128):
+    """Convert Tamil text to token IDs safely bounded by vocab_size."""
     text = normalize_tamil_text(text)
-    ids = [char2id.get(ch, 0) for ch in text]
+    ids = []
+    for ch in text:
+        token_id = char2id.get(ch, 0)
+        # Safety clamp to prevent CUDA gather kernel asserts
+        if token_id >= max_vocab_size:
+            token_id = 0
+        ids.append(token_id)
+
     ids = ids[:max_text_len]
     ids += [0] * (max_text_len - len(ids))
     return ids
 
 
 @torch.no_grad()
-def synthesize(model, text, char2id, device, ref_mel=None, max_text_len=200):
+def synthesize(model, text, char2id, device, vocab_size=128, ref_mel=None, max_text_len=200):
     """
     Generate speech audio from Tamil text.
-
-    Args:
-        model:    Loaded TamilTTS model (eval mode)
-        text:     Tamil text string
-        char2id:  Character-to-ID mapping
-        device:   torch device
-        ref_mel:  Optional reference mel [1, 80, T] for voice cloning.
-                  If None, uses a neutral zero-style vector.
-    Returns:
-        audio_np: numpy array of generated audio at 16kHz
-        mel_np:   numpy array of predicted mel spectrogram
     """
-    # 1. Tokenize text
-    token_ids = text_to_ids(text, char2id, max_text_len)
+    # 1. Tokenize text with safe vocab clamping
+    token_ids = text_to_ids(text, char2id, max_text_len, max_vocab_size=vocab_size)
     tokens = torch.tensor([token_ids], dtype=torch.long, device=device)  # [1, T_text]
 
-    # 2. Create reference mel (for style extraction)
+    # 2. Reference mel for style extraction
     if ref_mel is None:
-        # Use a short silence mel as neutral style reference
         ref_mel = torch.zeros(1, 80, 50, device=device)  # [1, 80, 50]
     elif ref_mel.dim() == 2:
-        ref_mel = ref_mel.unsqueeze(0)  # [80, T] -> [1, 80, T]
+        ref_mel = ref_mel.unsqueeze(0)
     ref_mel = ref_mel.to(device)
 
-    # 3. Forward pass (inference — no target_mel_len, model uses duration predictor freely)
-    audio, mel_pred, dur_pred = model(tokens, ref_mel, target_mel_len=None)
+    # 3. Model forward pass
+    eval_model = model.module if hasattr(model, "module") else model
+    eval_model.eval()
+
+    audio, mel_pred, dur_pred = eval_model(tokens, ref_mel, target_mel_len=None)
 
     # 4. Convert to numpy
     audio_np = audio.squeeze(0).cpu().numpy()  # [T_audio]
     mel_np = mel_pred.squeeze(0).cpu().numpy()  # [T_mel, 80]
 
-    # 5. Remove trailing silence (trim padding)
-    # Find last non-silent frame from duration predictions
+    # 5. Trim trailing silence based on predicted durations
     dur_np = dur_pred.squeeze(0).cpu().numpy()
     non_pad = (np.array(token_ids) != 0)
     total_dur_frames = int(np.sum(np.round(np.clip(dur_np[non_pad], 0, None))))
     if total_dur_frames > 0:
-        # Trim audio to predicted speech length
         hop_length = 256
         trim_samples = min(total_dur_frames * hop_length, len(audio_np))
-        audio_np = audio_np[:trim_samples]
+        if trim_samples > 1600:
+            audio_np = audio_np[:trim_samples]
+
+    # Normalize volume to avoid clipping
+    max_val = np.abs(audio_np).max()
+    if max_val > 0.01:
+        audio_np = audio_np / max_val * 0.95
 
     return audio_np, mel_np
 
@@ -119,26 +129,35 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Config()
 
-    # 1. Load model
     print("=" * 60)
-    print("  TamilTTS Inference")
+    print("  TamilTTS Inference Pipeline")
     print("=" * 60)
     print(f"  Device     : {device}")
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Text       : {args.text}")
 
-    model = TamilTTS(cfg).to(device)
+    # 1. Inspect checkpoint to auto-match vocab_size
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    emb_weight = ckpt["model_state_dict"].get("text_encoder.embedding.weight")
+    if emb_weight is not None:
+        ckpt_vocab_size = emb_weight.shape[0]
+        cfg.vocab_size = ckpt_vocab_size
+        print(f"  Vocab Size : {ckpt_vocab_size} (Auto-matched from checkpoint)")
+    else:
+        ckpt_vocab_size = cfg.vocab_size
+
+    # 2. Instantiate and load model
+    model = TamilTTS(cfg).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"  Loaded from step {ckpt['step']}, loss {ckpt['loss']:.4f}")
+    print(f"  Loaded from: Step {ckpt.get('step', 0)}, Loss {ckpt.get('loss', 0.0):.4f}")
 
-    # 2. Build vocabulary
-    char2id = build_char2id()
+    # 3. Build vocabulary bounded by checkpoint vocab size
+    char2id = build_char2id(max_vocab_size=ckpt_vocab_size)
 
-    # 3. Load reference audio for voice cloning (optional)
+    # 4. Optional voice cloning reference audio
     ref_mel = None
-    if args.ref_audio:
+    if args.ref_audio and os.path.exists(args.ref_audio):
         import librosa
         audio_ref, sr = librosa.load(args.ref_audio, sr=cfg.sample_rate)
         mel = librosa.feature.melspectrogram(
@@ -147,19 +166,25 @@ def main():
         )
         mel_db = librosa.power_to_db(mel, ref=np.max)
         ref_mel = torch.tensor(mel_db, dtype=torch.float32, device=device).unsqueeze(0)
-        print(f"  Ref Audio  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
+        print(f"  Ref Voice  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
 
-    # 4. Synthesize
-    print("\n  Generating speech...")
-    audio_np, mel_np = synthesize(model, args.text, char2id, device, ref_mel=ref_mel)
+    # 5. Synthesize
+    print("\n  Generating speech audio...")
+    audio_np, mel_np = synthesize(
+        model, args.text, char2id, device,
+        vocab_size=ckpt_vocab_size, ref_mel=ref_mel
+    )
 
-    # 5. Save output
+    # 6. Save output
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     sf.write(args.output, audio_np, cfg.sample_rate)
     duration = len(audio_np) / cfg.sample_rate
-    print(f"\n  ✅ Audio saved: {args.output}")
-    print(f"  Duration   : {duration:.2f}s")
+
+    print(f"\n  ✅ Speech Generated Successfully!")
+    print(f"  Output File: {args.output}")
+    print(f"  Duration   : {duration:.2f} seconds")
     print(f"  Sample Rate: {cfg.sample_rate} Hz")
-    print(f"  Mel Frames : {mel_np.shape[0]}")
+    print(f"  Audio Shape: {audio_np.shape}")
     print("=" * 60)
 
 

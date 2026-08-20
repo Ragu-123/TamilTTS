@@ -24,7 +24,9 @@ def length_regulate(x, durations, max_len=None):
 
     B, T, H = x.shape
     if max_len is None:
-        max_len = dur_rounded.sum(dim=1).max().item()
+        max_len = max(int(dur_rounded.sum(dim=1).max().item()), 1)
+    else:
+        max_len = max(int(max_len), 1)
 
     # Build expanded output
     output = torch.zeros(B, max_len, H, device=x.device, dtype=x.dtype)
