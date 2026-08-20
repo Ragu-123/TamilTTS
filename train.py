@@ -1,18 +1,20 @@
 """
-TamilTTS Training Script — v4 (DDP)
-=====================================
-- DistributedDataParallel: All 4 GPUs at ~95-100% utilization
-- Gradient Accumulation: Effective batch = per_gpu_batch * num_gpus * accum_steps
-- OOM Prevention: Small per-GPU batch (8) + accumulation (4) = effective batch 128
-- Each GPU has its own WavLM + IndicWhisper (no bottleneck on GPU 0)
-- Fallback: Works on single GPU without torchrun
+TamilTTS Training Script — v5 (Auto-DDP Multi-GPU)
+===================================================
+- Auto-Detects 4 GPUs: Works with BOTH `python train.py` and `torchrun`!
+- DistributedDataParallel: All 4 GPUs at ~95-100% compute evenly.
+- Per-GPU Critic Instances: Each GPU has its own WavLM + IndicWhisper.
+- OOM Prevention: per_gpu_batch=8, grad_accum_steps=4 (Effective batch = 128).
+- Progress & Metrics: Clear Epoch, Global Optimizer Step, and Loss Tracking.
 """
 import argparse
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
@@ -31,45 +33,23 @@ from datasets import load_dataset
 # Helpers
 # ---------------------------------------------------------------------------
 
-def is_main_process():
-    """Only rank 0 prints, saves checkpoints, and runs validation."""
-    return not dist.is_initialized() or dist.get_rank() == 0
+def is_main_process(rank=0):
+    return rank == 0
 
 
-def setup_ddp():
-    """Initialize DDP process group. Returns local_rank and device."""
-    if "LOCAL_RANK" not in os.environ:
-        # Not launched with torchrun → single GPU fallback
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return 0, device, False
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    device = torch.device(f"cuda:{local_rank}")
-    return local_rank, device, True
-
-
-def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def log(msg):
-    """Print only on rank 0."""
-    if is_main_process():
+def log(msg, rank=0):
+    if is_main_process(rank):
         print(msg)
 
 
 # ---------------------------------------------------------------------------
-# Validation (rank 0 only)
+# Validation (Rank 0 only)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def validate(model, val_loader, srfd_loss_fn, device, global_step):
     was_training = model.training
     model.eval()
-    # Use the unwrapped model for validation (avoid DDP forward hooks)
     eval_model = model.module if hasattr(model, "module") else model
 
     total_mel = 0.0
@@ -105,17 +85,68 @@ def validate(model, val_loader, srfd_loss_fn, device, global_step):
 
 
 # ---------------------------------------------------------------------------
-# Build DataLoaders (with DistributedSampler for DDP)
+# DDP Worker Function
 # ---------------------------------------------------------------------------
 
-def build_ddp_dataloaders(cfg, is_distributed):
-    """Build train/val DataLoaders with DistributedSampler when using DDP."""
-    log("Loading Shrutilipi dataset...")
+def train_worker(local_rank, world_size, cfg):
+    # 1. Setup Process Group
+    is_distributed = world_size > 1
+    if is_distributed:
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=local_rank,
+                world_size=world_size
+            )
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    log("=" * 60, local_rank)
+    log("  TamilTTS Training Pipeline (v5 — Auto-DDP Multi-GPU)", local_rank)
+    log("=" * 60, local_rank)
+
+    # 2. Model
+    model = TamilTTS(cfg).to(device)
+    total_p, train_p = count_parameters(model)
+    log(f"  Total Parameters    : {total_p / 1e6:.2f}M", local_rank)
+    log(f"  Trainable Parameters: {train_p / 1e6:.2f}M", local_rank)
+
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        log(f"  🔥 DDP Active       : {world_size} GPUs (Rank {local_rank} on cuda:{local_rank})", local_rank)
+    else:
+        log(f"  Single GPU Mode     : cuda", local_rank)
+
+    effective_batch = cfg.per_gpu_batch * world_size * cfg.grad_accum_steps
+    log(f"  Per-GPU Batch       : {cfg.per_gpu_batch}", local_rank)
+    log(f"  Gradient Accum Steps: {cfg.grad_accum_steps}", local_rank)
+    log(f"  Effective Batch Size: {effective_batch} (across {world_size} GPUs)", local_rank)
+
+    # 3. Optimizer & Scheduler
+    optimizer = Lion(model.parameters(), lr=cfg.learning_rate)
+    scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
+
+    # 4. Critics (Dedicated copy per GPU)
+    log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
+    wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir).to(device)
+    slm_loss_fn = SLMLoss(wavlm)
+
+    log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
+    whisper_enc = WhisperModel.from_pretrained(cfg.whisper_dir).encoder.to(device)
+    whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
+    srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext)
+
+    # 5. Dataset & Distributed Samplers
+    log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
+    log("Loading Shrutilipi dataset...", local_rank)
     full_ds = load_dataset("parquet", data_dir=cfg.dataset_dir, split="train")
     split = full_ds.train_test_split(test_size=cfg.val_split, seed=42)
 
-    log(f"  Train samples: {len(split['train'])}")
-    log(f"  Val samples  : {len(split['test'])}")
+    log(f"  Train samples       : {len(split['train'])}", local_rank)
+    log(f"  Val samples         : {len(split['test'])}", local_rank)
 
     train_ds = ShrutilipiDataset(
         split["train"], max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
@@ -126,9 +157,8 @@ def build_ddp_dataloaders(cfg, is_distributed):
         mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
     )
 
-    # DDP: each GPU sees a unique shard of the data
-    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
-    val_sampler   = DistributedSampler(val_ds, shuffle=False)  if is_distributed else None
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
+    val_sampler   = DistributedSampler(val_ds, num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
 
     train_loader = DataLoader(
         train_ds,
@@ -148,90 +178,43 @@ def build_ddp_dataloaders(cfg, is_distributed):
         pin_memory=True,
         drop_last=False,
     )
-    return train_loader, val_loader, train_sampler
 
+    batches_per_gpu = len(train_loader)
+    opt_steps_per_epoch = batches_per_gpu // cfg.grad_accum_steps
+    total_epochs = (cfg.total_steps // max(1, opt_steps_per_epoch)) + 1
 
-# ---------------------------------------------------------------------------
-# Main Training Loop
-# ---------------------------------------------------------------------------
+    log(f"  Batches/GPU/epoch   : {batches_per_gpu}", local_rank)
+    log(f"  Opt steps/epoch     : {opt_steps_per_epoch}", local_rank)
+    log(f"  Val batches         : {len(val_loader)}", local_rank)
+    log(f"  Total target steps  : {cfg.total_steps}", local_rank)
+    log(f"  Epochs needed       : {total_epochs}", local_rank)
+    log("=" * 60, local_rank)
 
-def train(cfg):
-    local_rank, device, is_distributed = setup_ddp()
-    world_size = dist.get_world_size() if is_distributed else 1
-
-    log("=" * 60)
-    log("  TamilTTS Training Pipeline (v4 — DDP + Gradient Accumulation)")
-    log("=" * 60)
-
-    # --- Model ---
-    model = TamilTTS(cfg).to(device)
-    total_p, train_p = count_parameters(model)
-    log(f"  Total Parameters    : {total_p / 1e6:.2f}M")
-    log(f"  Trainable Parameters: {train_p / 1e6:.2f}M")
-
-    if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-        log(f"  DDP Active          : {world_size} GPUs (each sees {cfg.per_gpu_batch} samples)")
-    else:
-        gpu_count = torch.cuda.device_count()
-        log(f"  Single GPU Mode     : {gpu_count} GPU(s) detected")
-
-    effective_batch = cfg.per_gpu_batch * world_size * cfg.grad_accum_steps
-    log(f"  Per-GPU Batch       : {cfg.per_gpu_batch}")
-    log(f"  Gradient Accum Steps: {cfg.grad_accum_steps}")
-    log(f"  Effective Batch Size: {effective_batch}")
-
-    # --- Optimizer ---
-    optimizer = Lion(model.parameters(), lr=cfg.learning_rate)
-    scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
-
-    # --- Critics (each GPU gets its own copy — no bottleneck!) ---
-    log(f"  Loading WavLM       : {cfg.wavlm_dir}")
-    wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir).to(device)
-    slm_loss_fn = SLMLoss(wavlm)
-
-    log(f"  Loading IndicWhisper: {cfg.whisper_dir}")
-    whisper_enc = WhisperModel.from_pretrained(cfg.whisper_dir).encoder.to(device)
-    whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
-    srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext)
-
-    # --- Data ---
-    log(f"  Dataset             : {cfg.dataset_dir}")
-    train_loader, val_loader, train_sampler = build_ddp_dataloaders(cfg, is_distributed)
-    steps_per_epoch = len(train_loader)
-    total_epochs = (cfg.total_steps // steps_per_epoch) + 1
-    log(f"  Train steps/epoch   : {steps_per_epoch}")
-    log(f"  Val batches         : {len(val_loader)}")
-    log(f"  Total steps target  : {cfg.total_steps}")
-    log(f"  Epochs needed       : {total_epochs}")
-    log("=" * 60)
-
-    # --- Resume ---
+    # 6. Resume
     global_step = 0
     best_val_loss = float("inf")
     resume_path = os.path.join(cfg.checkpoint_dir, "latest.pt")
     if os.path.exists(resume_path):
         global_step = load_checkpoint(resume_path, model, optimizer, scheduler)
 
-    # --- Training Loop ---
+    # 7. Training Loop
     model.train()
     for epoch in range(total_epochs):
         if global_step >= cfg.total_steps:
             break
 
-        # DDP: reshuffle data each epoch
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         pbar = tqdm(
-            enumerate(train_loader), total=steps_per_epoch,
-            desc=f"Epoch {epoch+1}/{total_epochs}", unit="step", ncols=140,
-            disable=not is_main_process(),
+            enumerate(train_loader), total=batches_per_gpu,
+            desc=f"Epoch {epoch+1}/{total_epochs}", unit="batch", ncols=140,
+            disable=not is_main_process(local_rank),
         )
 
         optimizer.zero_grad()
 
-        for step, (text_tokens, ref_mel, real_audio) in pbar:
+        for batch_idx, (text_tokens, ref_mel, real_audio) in pbar:
             if global_step >= cfg.total_steps:
                 break
 
@@ -262,19 +245,18 @@ def train(cfg):
                 + cfg.weight_dur * loss_dur
             )
 
-            # Scale loss by accumulation steps (so gradients average correctly)
             scaled_loss = total_loss / cfg.grad_accum_steps
             scaled_loss.backward()
 
-            # --- Gradient Accumulation: only step every N micro-batches ---
-            if (step + 1) % cfg.grad_accum_steps == 0:
+            # Optimizer Step on Accumulation
+            if (batch_idx + 1) % cfg.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
-                if is_main_process():
+                if is_main_process(local_rank):
                     pbar.set_postfix({
                         "step": global_step,
                         "loss": f"{total_loss.item():.3f}",
@@ -284,16 +266,16 @@ def train(cfg):
                         "lr": f"{scheduler.get_last_lr()[0]:.1e}",
                     })
 
-                # --- Checkpoint (rank 0 only) ---
-                if is_main_process() and global_step % cfg.save_every == 0:
+                # Checkpoint (Rank 0 only)
+                if is_main_process(local_rank) and global_step % cfg.save_every == 0:
                     save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
                                     os.path.join(cfg.checkpoint_dir, "latest.pt"))
                     save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
                                     os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"))
                     print(f"\n  [Checkpoint] Saved at step {global_step}")
 
-                # --- Validation (rank 0 only) ---
-                if is_main_process() and global_step % cfg.val_every == 0:
+                # Validation (Rank 0 only)
+                if is_main_process(local_rank) and global_step % cfg.val_every == 0:
                     val_mel, val_srfd = validate(model, val_loader, srfd_loss_fn, device, global_step)
                     print(f"\n  [Val @ step {global_step}] Mel L1: {val_mel:.4f} | SR-FD: {val_srfd:.4f}")
                     if val_mel < best_val_loss:
@@ -302,12 +284,10 @@ def train(cfg):
                                         os.path.join(cfg.checkpoint_dir, "best.pt"))
                         print(f"  [Val] New best model saved! (Mel L1: {val_mel:.4f})")
 
-                # Synchronize all GPUs after validation/checkpoint
                 if is_distributed:
                     dist.barrier()
 
-    # --- Final Save ---
-    if is_main_process():
+    if is_main_process(local_rank):
         save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
                         os.path.join(cfg.checkpoint_dir, "final.pt"))
         print("\n" + "=" * 60)
@@ -316,10 +296,15 @@ def train(cfg):
         print(f"  Best val Mel L1: {best_val_loss:.4f}")
         print("=" * 60)
 
-    cleanup_ddp()
+    if is_distributed:
+        dist.destroy_process_group()
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Main Launcher
+# ---------------------------------------------------------------------------
+
+def main():
     parser = argparse.ArgumentParser(description="TamilTTS DDP Training")
     parser.add_argument("--dataset_dir", type=str, default=None)
     parser.add_argument("--wavlm_dir", type=str, default=None)
@@ -345,4 +330,24 @@ if __name__ == "__main__":
         import shutil
         shutil.copy(args.resume, os.path.join(cfg.checkpoint_dir, "latest.pt"))
 
-    train(cfg)
+    # Case 1: Launched via torchrun
+    if "LOCAL_RANK" in os.environ or "RANK" in os.environ:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        train_worker(local_rank, world_size, cfg)
+
+    # Case 2: Launched via regular `python train.py` on Multi-GPU machine -> Auto-spawn DDP
+    elif torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        world_size = torch.cuda.device_count()
+        print(f"🔥 Detected {world_size} GPUs! Auto-spawning DDP multi-process training...")
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+        mp.spawn(train_worker, nprocs=world_size, args=(world_size, cfg))
+
+    # Case 3: Single GPU
+    else:
+        train_worker(0, 1, cfg)
+
+
+if __name__ == "__main__":
+    main()
