@@ -24,7 +24,7 @@ from transformers import WhisperModel, WhisperFeatureExtractor, WavLMModel
 from config import Config
 from models import TamilTTS
 from losses import SLMLoss, SRFDLoss
-from data import TamilTTSDataset, load_dataset_splits
+from data import build_tamil_datasets, build_dataloaders
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
 from datasets import load_dataset
 
@@ -141,19 +141,7 @@ def train_worker(local_rank, world_size, cfg):
 
     # 5. Dataset & Distributed Samplers
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
-    train_raw, val_raw = load_dataset_splits(cfg.dataset_dir, val_split=cfg.val_split)
-
-    log(f"  Train samples       : {len(train_raw)}", local_rank)
-    log(f"  Val samples         : {len(val_raw)}", local_rank)
-
-    train_ds = TamilTTSDataset(
-        train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-        mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
-    val_ds = TamilTTSDataset(
-        val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-        mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
+    train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
     val_sampler   = DistributedSampler(val_ds, num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None

@@ -4,7 +4,7 @@ import glob
 import torch
 import numpy as np
 import librosa
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from datasets import load_dataset
 from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
 
@@ -19,12 +19,6 @@ def normalize_tamil_text(text):
     """
     Clean Tamil text using indic-nlp-library + custom rules.
     This runs BEFORE character tokenization.
-
-    What it does:
-    1. indic-nlp normalizer: fixes Unicode variations of Tamil chars,
-       removes zero-width joiners/non-joiners, standardizes punctuation
-    2. Subscript digits: ₀₁₂₃ -> 0123
-    3. Strip extra whitespace
     """
     if not isinstance(text, str):
         return ""
@@ -164,70 +158,129 @@ class TamilTTSDataset(Dataset):
 ShrutilipiDataset = TamilTTSDataset
 
 
-def load_dataset_splits(dataset_path, val_split=0.05):
-    """
-    Intelligently loads dataset splits from:
-      1. Folder containing train.parquet + test.parquet (e.g. Rasa)
-      2. Multi-file parquet directory (e.g. IndicVoices-R, Shrutilipi)
-      3. Single parquet file
-    """
-    # Auto-resolve Kaggle input path variations
+def resolve_dataset_path(path):
+    """Auto-resolve Kaggle input path variations."""
+    if not isinstance(path, str):
+        return path
     search_paths = [
-        dataset_path,
-        dataset_path.replace("/datasets/ragunathravi/", "/"),
-        f"/kaggle/input/{os.path.basename(dataset_path)}",
-        f"/kaggle/input/datasets/ragunathravi/{os.path.basename(dataset_path)}"
+        path,
+        path.replace("/datasets/ragunathravi/", "/"),
+        f"/kaggle/input/{os.path.basename(path)}",
+        f"/kaggle/input/datasets/ragunathravi/{os.path.basename(path)}",
+        f"/kaggle/input/{path}",
     ]
-    
-    resolved_path = dataset_path
     for p in search_paths:
         if os.path.exists(p):
-            resolved_path = p
-            break
+            return p
+    return path
 
-    # Case 1: Folder containing dedicated train.parquet and test.parquet (Rasa)
-    train_file = os.path.join(resolved_path, "train.parquet")
-    test_file = os.path.join(resolved_path, "test.parquet")
-    if os.path.isfile(train_file):
-        print(f"Loading train split from: {train_file}")
-        train_ds = load_dataset("parquet", data_files={"train": train_file})["train"]
-        if os.path.isfile(test_file):
-            print(f"Loading test split from: {test_file}")
-            val_ds = load_dataset("parquet", data_files={"test": test_file})["test"]
-        else:
-            split = train_ds.train_test_split(test_size=val_split, seed=42)
-            train_ds, val_ds = split["train"], split["test"]
-        return train_ds, val_ds
 
-    # Case 2: Direct file path
+def load_single_dataset_splits(dataset_path, val_split=0.05):
+    """
+    Loads train and test splits for a single dataset path.
+    Supports:
+      - Rasa (train.parquet / test.parquet)
+      - IndicVoices-R (train-*.parquet / test-*.parquet)
+      - Sharded parquet directory
+      - Single parquet file
+    """
+    resolved_path = resolve_dataset_path(dataset_path)
+
+    # 1. Check for explicit train-*.parquet and test-*.parquet files (IndicVoices-R & Rasa)
+    if os.path.isdir(resolved_path):
+        train_files = sorted(glob.glob(os.path.join(resolved_path, "*train*.parquet")))
+        test_files  = sorted(glob.glob(os.path.join(resolved_path, "*test*.parquet")))
+
+        if train_files:
+            print(f"  ✓ Found {len(train_files)} train parquet file(s) in {resolved_path}")
+            train_ds = load_dataset("parquet", data_files={"train": train_files})["train"]
+            if test_files:
+                print(f"  ✓ Found {len(test_files)} test parquet file(s) in {resolved_path}")
+                val_ds = load_dataset("parquet", data_files={"test": test_files})["test"]
+            else:
+                split = train_ds.train_test_split(test_size=val_split, seed=42)
+                train_ds, val_ds = split["train"], split["test"]
+            return train_ds, val_ds
+
+        # Shards without train/test in filename
+        all_parquets = sorted(glob.glob(os.path.join(resolved_path, "*.parquet")))
+        if all_parquets:
+            print(f"  ✓ Found {len(all_parquets)} parquet file(s) in {resolved_path}")
+            full_ds = load_dataset("parquet", data_files={"train": all_parquets})["train"]
+            split = full_ds.train_test_split(test_size=val_split, seed=42)
+            return split["train"], split["test"]
+
+    # 2. Single Parquet file
     if os.path.isfile(resolved_path):
-        print(f"Loading single parquet file from: {resolved_path}")
+        print(f"  ✓ Loading single parquet file: {resolved_path}")
         full_ds = load_dataset("parquet", data_files={"train": resolved_path})["train"]
         split = full_ds.train_test_split(test_size=val_split, seed=42)
         return split["train"], split["test"]
 
-    # Case 3: Directory of parquet shards
-    print(f"Loading parquet directory from: {resolved_path}")
-    full_ds = load_dataset("parquet", data_dir=resolved_path, split="train")
-    split = full_ds.train_test_split(test_size=val_split, seed=42)
-    return split["train"], split["test"]
+    raise FileNotFoundError(f"Could not locate valid parquet files at: {dataset_path} (resolved: {resolved_path})")
+
+
+def build_tamil_datasets(dataset_dirs, cfg):
+    """
+    Builds and combines datasets from one or multiple paths.
+    Returns: (train_dataset, val_dataset) as PyTorch Datasets.
+    """
+    # Parse multiple comma-separated paths if provided
+    if isinstance(dataset_dirs, str):
+        paths = [p.strip() for p in dataset_dirs.split(",") if p.strip()]
+    elif isinstance(dataset_dirs, (list, tuple)):
+        paths = list(dataset_dirs)
+    else:
+        paths = [str(dataset_dirs)]
+
+    train_datasets = []
+    val_datasets = []
+
+    print("=" * 60)
+    print(f"  Loading & Combining {len(paths)} Tamil Dataset Source(s)...")
+    print("=" * 60)
+
+    for p in paths:
+        try:
+            train_raw, val_raw = load_single_dataset_splits(p, val_split=cfg.val_split)
+            print(f"    --> Source: {os.path.basename(p)} | Train: {len(train_raw):,} | Val: {len(val_raw):,}")
+
+            train_ds = TamilTTSDataset(
+                train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+                mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
+            )
+            val_ds = TamilTTSDataset(
+                val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+                mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
+            )
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
+        except Exception as e:
+            print(f"    ⚠️ Warning: Could not load dataset at '{p}': {e}")
+
+    if not train_datasets:
+        raise RuntimeError("No valid Tamil datasets could be loaded! Please check dataset paths.")
+
+    # Combine datasets
+    if len(train_datasets) > 1:
+        final_train_ds = ConcatDataset(train_datasets)
+        final_val_ds   = ConcatDataset(val_datasets)
+    else:
+        final_train_ds = train_datasets[0]
+        final_val_ds   = val_datasets[0]
+
+    print(f"\n  🎉 Combined Dataset Total:")
+    print(f"     • Total Train Samples: {len(final_train_ds):,}")
+    print(f"     • Total Val Samples  : {len(final_val_ds):,}")
+    print(f"     • Grand Total Audio  : {len(final_train_ds) + len(final_val_ds):,} studio samples (~75k+)")
+    print("=" * 60)
+
+    return final_train_ds, final_val_ds
 
 
 def build_dataloaders(cfg):
-    """Build train and validation DataLoaders."""
-    train_raw, val_raw = load_dataset_splits(cfg.dataset_dir, val_split=cfg.val_split)
-
-    print(f"  Train samples: {len(train_raw)}")
-    print(f"  Val samples  : {len(val_raw)}")
-
-    train_ds = TamilTTSDataset(
-        train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-        mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
-    val_ds = TamilTTSDataset(
-        val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
-        mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
+    """Build train and validation DataLoaders (supports multi-dataset combination)."""
+    train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size if hasattr(cfg, 'batch_size') else cfg.per_gpu_batch,
