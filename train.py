@@ -202,8 +202,13 @@ def train_worker(local_rank, world_size, cfg):
     if os.path.exists(resume_path):
         global_step = load_checkpoint(resume_path, model, optimizer, scheduler)
 
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # 7. Training Loop
-    model.train()
+    try:
+        model.train()
     for epoch in range(total_epochs):
         if global_step >= cfg.total_steps:
             break
@@ -300,17 +305,21 @@ def train_worker(local_rank, world_size, cfg):
                 if is_distributed:
                     dist.barrier()
 
-    if is_main_process(local_rank):
-        save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
-                        os.path.join(cfg.checkpoint_dir, "final.pt"))
-        print("\n" + "=" * 60)
-        print("  Training Complete!")
-        print(f"  Final step: {global_step}")
-        print(f"  Best val Mel L1: {best_val_loss:.4f}")
-        print("=" * 60)
+        if is_main_process(local_rank):
+            save_checkpoint(model, optimizer, scheduler, global_step, total_loss.item(),
+                            os.path.join(cfg.checkpoint_dir, "final.pt"))
+            print("\n" + "=" * 60)
+            print("  Training Complete!")
+            print(f"  Final step: {global_step}")
+            print(f"  Best val Mel L1: {best_val_loss:.4f}")
+            print("=" * 60)
 
-    if is_distributed and dist.is_initialized():
-        dist.destroy_process_group()
+    finally:
+        if is_distributed and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

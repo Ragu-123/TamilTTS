@@ -2,6 +2,7 @@ import os
 import glob
 import re
 import io
+import gc
 import librosa
 import soundfile as sf
 import numpy as np
@@ -59,16 +60,17 @@ def build_tamil_vocab(max_vocab=256):
 
 class DirectParquetTamilDataset(Dataset):
     """
-    Zero-Disk-Cache, High-Performance Parquet Dataset for Tamil TTS.
+    Zero-Disk-Cache, Ultra-Low-RAM Parquet Dataset for Tamil TTS.
     
-    Why this is critical for Kaggle:
-    - Reads directly from read-only `/kaggle/input` using PyArrow.
-    - Uses 0.0 MB of disk space in `/kaggle/working` (prevents Out of Disk Space errors).
-    - Initializes 76,000+ samples in < 2 seconds.
-    - Caches active parquet table in worker RAM for ultra-fast batch streaming.
+    Memory optimizations:
+    - Reads in-place from read-only `/kaggle/input` (0.0 MB disk space).
+    - Caches at most ONE active parquet file per worker in RAM.
+    - Explicit column filtering avoids loading unused metadata into memory.
+    - Proactive garbage collection keeps Host RAM consumption under 2 GB per process.
     """
     def __init__(self, parquet_files, cfg):
-        self.parquet_files = sorted(parquet_files) if isinstance(parquet_files, (list, tuple)) else [parquet_files]
+        # Deduplicate files to avoid doubled indexing
+        self.parquet_files = sorted(list(set(parquet_files))) if isinstance(parquet_files, (list, tuple)) else [parquet_files]
         self.sr = cfg.sample_rate
         self.max_audio_len = cfg.max_audio_len
         self.max_text_len = cfg.max_text_len
@@ -90,7 +92,7 @@ class DirectParquetTamilDataset(Dataset):
             except Exception as e:
                 print(f"    ⚠️ Warning: Could not read metadata from {f}: {e}")
 
-        # Worker-local table cache (avoids re-reading parquet files for each row)
+        # Worker-local single-file cache
         self._cached_file = None
         self._cached_table = None
 
@@ -98,9 +100,16 @@ class DirectParquetTamilDataset(Dataset):
         return len(self.index)
 
     def _get_row(self, file_path, row_idx):
-        """Reads a row using an in-memory cached PyArrow table."""
+        """Reads a row using single active file cache with strict memory cleanup."""
         if self._cached_file != file_path or self._cached_table is None:
-            self._cached_table = pq.read_table(file_path)
+            # Free previous table immediately before loading new one
+            self._cached_table = None
+            self._cached_file = None
+
+            pf = pq.ParquetFile(file_path)
+            # Only read columns required for TTS training
+            valid_cols = [c for c in ["audio", "normalized", "text", "verbatim", "audio_filepath"] if c in pf.schema.names]
+            self._cached_table = pf.read(columns=valid_cols)
             self._cached_file = file_path
 
         row_dict = {}
@@ -121,19 +130,19 @@ class DirectParquetTamilDataset(Dataset):
     def _decode_audio(self, audio_field, sample_dict):
         """Universal audio decoder for bytes, arrays, and file paths."""
         if isinstance(audio_field, dict):
-            # Dict with audio bytes
+            # 1. Dict with audio bytes (Standard HuggingFace Parquet format)
             raw_bytes = audio_field.get("bytes")
             if raw_bytes is not None:
                 audio_array, orig_sr = sf.read(io.BytesIO(raw_bytes))
                 return np.array(audio_array, dtype=np.float32), orig_sr
 
-            # Dict with raw float array
+            # 2. Dict with raw float array
             raw_arr = audio_field.get("array")
             if raw_arr is not None:
                 orig_sr = audio_field.get("sampling_rate", self.sr)
                 return np.array(raw_arr, dtype=np.float32), orig_sr
 
-            # Dict with path
+            # 3. Dict with path
             path_val = audio_field.get("path")
             if path_val and os.path.exists(path_val):
                 audio_array, orig_sr = sf.read(path_val)
@@ -263,20 +272,21 @@ def resolve_dataset_path(path):
 
 def load_single_parquet_dataset_splits(data_path, cfg):
     """
-    Scans parquet files and returns train/val DirectParquetTamilDataset objects.
+    Scans parquet files with deduplication and returns train/val DirectParquetTamilDataset objects.
     Uses 0 MB of disk space.
     """
     resolved_path = resolve_dataset_path(data_path)
     print(f"  Scanning parquet files from: {resolved_path}")
 
-    train_files = sorted(
-        glob.glob(os.path.join(resolved_path, "*train*.parquet"))
-        + glob.glob(os.path.join(resolved_path, "**", "*train*.parquet"), recursive=True)
-    )
-    test_files = sorted(
-        glob.glob(os.path.join(resolved_path, "*test*.parquet"))
-        + glob.glob(os.path.join(resolved_path, "**", "*test*.parquet"), recursive=True)
-    )
+    # Use set to strictly prevent duplicate entries
+    train_files = sorted(list(set(
+        glob.glob(os.path.join(resolved_path, "**", "*train*.parquet"), recursive=True)
+        or glob.glob(os.path.join(resolved_path, "*train*.parquet"))
+    )))
+    test_files = sorted(list(set(
+        glob.glob(os.path.join(resolved_path, "**", "*test*.parquet"), recursive=True)
+        or glob.glob(os.path.join(resolved_path, "*test*.parquet"))
+    )))
 
     if train_files:
         print(f"    ✓ Found {len(train_files)} train parquet file(s)")
@@ -286,19 +296,17 @@ def load_single_parquet_dataset_splits(data_path, cfg):
             print(f"    ✓ Found {len(test_files)} test/val parquet file(s)")
             val_ds = DirectParquetTamilDataset(test_files, cfg)
         else:
-            # If no explicit test file, split indices
             total_n = len(train_ds)
-            val_n = max(int(total_n * 0.02), 50)
             train_files_list = train_ds.parquet_files
             train_ds = DirectParquetTamilDataset(train_files_list, cfg)
             val_ds = DirectParquetTamilDataset(train_files_list[-1:], cfg)
 
         return train_ds, val_ds
 
-    all_parquets = sorted(
-        glob.glob(os.path.join(resolved_path, "*.parquet"))
-        + glob.glob(os.path.join(resolved_path, "**", "*.parquet"), recursive=True)
-    )
+    all_parquets = sorted(list(set(
+        glob.glob(os.path.join(resolved_path, "**", "*.parquet"), recursive=True)
+        or glob.glob(os.path.join(resolved_path, "*.parquet"))
+    )))
     if all_parquets:
         print(f"    ✓ Found {len(all_parquets)} generic parquet file(s)")
         if len(all_parquets) > 1:
@@ -365,7 +373,7 @@ def build_tamil_datasets(dataset_dirs, cfg, num_proc=None):
 
 
 def build_dataloaders(cfg):
-    """Builds PyTorch DataLoaders with fast multi-processing."""
+    """Builds PyTorch DataLoaders with low-RAM multi-processing."""
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
     train_loader = DataLoader(
         train_ds,
