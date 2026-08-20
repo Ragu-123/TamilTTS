@@ -1,4 +1,6 @@
+import os
 import re
+import glob
 import torch
 import numpy as np
 import librosa
@@ -24,18 +26,21 @@ def normalize_tamil_text(text):
     2. Subscript digits: ₀₁₂₃ -> 0123
     3. Strip extra whitespace
     """
+    if not isinstance(text, str):
+        return ""
     text = _tamil_normalizer.normalize(text)
     text = text.translate(_SUBSCRIPT_MAP)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-class ShrutilipiDataset(Dataset):
+class TamilTTSDataset(Dataset):
     """
-    Shrutilipi Tamil dataset with:
-    - indic-nlp-library text normalization
-    - Corrupted audio: skips to next index (no random, no zeros)
-    - Proper mel spectrogram extraction
+    Universal High-Fidelity Tamil TTS Dataset.
+    Supports:
+      - AI4Bharat Rasa (Studio Expressive TTS): ['text', 'audio', 'gender', 'style', 'duration']
+      - AI4Bharat IndicVoices-R (Clean Read Speech): ['normalized', 'text', 'audio', 'verbatim']
+      - AI4Bharat Shrutilipi: ['text', 'audio_filepath']
     """
     def __init__(self, hf_dataset, max_audio_len=48000, max_text_len=200,
                  mel_channels=80, n_fft=1024, hop_length=256, sr=16000):
@@ -58,8 +63,8 @@ class ShrutilipiDataset(Dataset):
         for d in "0123456789":
             self.char2id[d] = idx
             idx += 1
-        # Common punctuation (important for prosody)
-        for p in list(".,!?;:-"):
+        # Common punctuation (important for prosody & pauses)
+        for p in list(".,!?;:-'\""):
             self.char2id[p] = idx
             idx += 1
         self.vocab_size = idx
@@ -77,8 +82,8 @@ class ShrutilipiDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        If a sample has corrupted audio, skip to the NEXT valid index.
-        No random sampling, no zero tensors.
+        Extract normalized text, raw audio, and compute mel-spectrogram.
+        If a sample is corrupted, seamlessly skip to the next index.
         """
         total = len(self)
         for offset in range(total):
@@ -86,23 +91,44 @@ class ShrutilipiDataset(Dataset):
             try:
                 sample = self.ds[actual_idx]
 
-                # --- Text (with indic-nlp normalization) ---
-                text = sample["text"]
+                # --- 1. Extract Text (Supports Rasa, IndicVoices-R, Shrutilipi) ---
+                text = (
+                    sample.get("normalized")
+                    or sample.get("text")
+                    or sample.get("verbatim")
+                    or ""
+                )
+                if not text.strip():
+                    continue
+
                 token_ids = torch.tensor(self.text_to_ids(text), dtype=torch.long)
 
-                # --- Audio ---
-                audio_data = sample["audio_filepath"]
-                audio_array = np.array(audio_data["array"], dtype=np.float32)
-                sr = audio_data["sampling_rate"]
+                # --- 2. Extract Audio (Supports audio dict, AudioDecoder, audio_filepath) ---
+                audio_data = sample.get("audio") or sample.get("audio_filepath")
+                if audio_data is None:
+                    continue
 
+                if isinstance(audio_data, dict):
+                    audio_array = np.array(audio_data["array"], dtype=np.float32)
+                    sr = audio_data.get("sampling_rate", self.sr)
+                elif hasattr(audio_data, "get_all_samples"):  # AudioDecoder object
+                    audio_array = np.array(audio_data["array"], dtype=np.float32)
+                    sr = getattr(audio_data, "sampling_rate", self.sr)
+                elif isinstance(audio_data, str):  # file path string
+                    audio_array, sr = librosa.load(audio_data, sr=self.sr)
+                else:
+                    audio_array = np.array(audio_data, dtype=np.float32)
+                    sr = self.sr
+
+                # Resample to 16kHz if needed
                 if sr != self.sr:
                     audio_array = librosa.resample(y=audio_array, orig_sr=sr, target_sr=self.sr)
 
-                # Skip extremely short audio (< 0.1 seconds)
+                # Skip extremely short audio (< 0.1s)
                 if len(audio_array) < 1600:
                     continue
 
-                # Pad or truncate
+                # Pad or truncate raw waveform
                 if len(audio_array) > self.max_audio_len:
                     audio_array = audio_array[:self.max_audio_len]
                 else:
@@ -110,14 +136,14 @@ class ShrutilipiDataset(Dataset):
 
                 audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
 
-                # --- Mel Spectrogram ---
+                # --- 3. Mel Spectrogram ---
                 mel = librosa.feature.melspectrogram(
                     y=audio_array, sr=self.sr, n_fft=self.n_fft,
                     hop_length=self.hop_length, n_mels=self.mel_channels,
                 )
                 mel_db = librosa.power_to_db(mel, ref=np.max)
 
-                # Pad or truncate mel to fixed length
+                # Pad or truncate mel to fixed length (188 frames)
                 if mel_db.shape[1] > self.max_mel_len:
                     mel_db = mel_db[:, :self.max_mel_len]
                 else:
@@ -128,37 +154,87 @@ class ShrutilipiDataset(Dataset):
                 return token_ids, mel_tensor, audio_tensor
 
             except Exception:
-                # This sample is corrupted, try next index
+                # Corrupted sample, skip to next index
                 continue
 
-        # Should never reach here (would mean entire dataset is corrupt)
         raise RuntimeError(f"Could not find any valid sample starting from index {idx}")
 
 
+# Backward compatibility alias
+ShrutilipiDataset = TamilTTSDataset
+
+
+def load_dataset_splits(dataset_path, val_split=0.05):
+    """
+    Intelligently loads dataset splits from:
+      1. Folder containing train.parquet + test.parquet (e.g. Rasa)
+      2. Multi-file parquet directory (e.g. IndicVoices-R, Shrutilipi)
+      3. Single parquet file
+    """
+    # Auto-resolve Kaggle input path variations
+    search_paths = [
+        dataset_path,
+        dataset_path.replace("/datasets/ragunathravi/", "/"),
+        f"/kaggle/input/{os.path.basename(dataset_path)}",
+        f"/kaggle/input/datasets/ragunathravi/{os.path.basename(dataset_path)}"
+    ]
+    
+    resolved_path = dataset_path
+    for p in search_paths:
+        if os.path.exists(p):
+            resolved_path = p
+            break
+
+    # Case 1: Folder containing dedicated train.parquet and test.parquet (Rasa)
+    train_file = os.path.join(resolved_path, "train.parquet")
+    test_file = os.path.join(resolved_path, "test.parquet")
+    if os.path.isfile(train_file):
+        print(f"Loading train split from: {train_file}")
+        train_ds = load_dataset("parquet", data_files={"train": train_file})["train"]
+        if os.path.isfile(test_file):
+            print(f"Loading test split from: {test_file}")
+            val_ds = load_dataset("parquet", data_files={"test": test_file})["test"]
+        else:
+            split = train_ds.train_test_split(test_size=val_split, seed=42)
+            train_ds, val_ds = split["train"], split["test"]
+        return train_ds, val_ds
+
+    # Case 2: Direct file path
+    if os.path.isfile(resolved_path):
+        print(f"Loading single parquet file from: {resolved_path}")
+        full_ds = load_dataset("parquet", data_files={"train": resolved_path})["train"]
+        split = full_ds.train_test_split(test_size=val_split, seed=42)
+        return split["train"], split["test"]
+
+    # Case 3: Directory of parquet shards
+    print(f"Loading parquet directory from: {resolved_path}")
+    full_ds = load_dataset("parquet", data_dir=resolved_path, split="train")
+    split = full_ds.train_test_split(test_size=val_split, seed=42)
+    return split["train"], split["test"]
+
+
 def build_dataloaders(cfg):
-    """Load dataset and split into train (95%) and val (5%)."""
-    print("Loading Shrutilipi dataset...")
-    full_ds = load_dataset("parquet", data_dir=cfg.dataset_dir, split="train")
-    split = full_ds.train_test_split(test_size=cfg.val_split, seed=42)
+    """Build train and validation DataLoaders."""
+    train_raw, val_raw = load_dataset_splits(cfg.dataset_dir, val_split=cfg.val_split)
 
-    print(f"  Train samples: {len(split['train'])}")
-    print(f"  Val samples  : {len(split['test'])}")
+    print(f"  Train samples: {len(train_raw)}")
+    print(f"  Val samples  : {len(val_raw)}")
 
-    train_ds = ShrutilipiDataset(
-        split["train"], max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+    train_ds = TamilTTSDataset(
+        train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
         mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
     )
-    val_ds = ShrutilipiDataset(
-        split["test"], max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+    val_ds = TamilTTSDataset(
+        val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
         mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+        train_ds, batch_size=cfg.batch_size if hasattr(cfg, 'batch_size') else cfg.per_gpu_batch,
+        shuffle=True, num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
+        val_ds, batch_size=cfg.batch_size if hasattr(cfg, 'batch_size') else cfg.per_gpu_batch,
+        shuffle=False, num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
     )
     return train_loader, val_loader

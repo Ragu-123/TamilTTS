@@ -1,59 +1,50 @@
-# TamilTTS v4 (DDP)
+# TamilTTS v5 (Studio High-Fidelity Multi-GPU DDP)
 
-68.55M parameter Tamil TTS with DistributedDataParallel multi-GPU training.
+68.55M parameter Tamil TTS trained on clean studio-recorded speech with DistributedDataParallel.
 
-## Key Features (v4)
-- **DDP Multi-GPU**: All GPUs at ~95-100% utilization (no GPU 0 bottleneck)
-- **Gradient Accumulation**: Effective batch 128 without OOM (8 per GPU × 4 GPUs × 4 accum)
-- **Length Regulation**: Duration predictor expands text features to match mel length
-- **indic-nlp Normalizer**: Unicode normalization before character tokenization
-- **Corrupted Audio Handling**: Automatically skips bad samples to next index
-- **Checkpointing**: latest.pt, best.pt, step_N.pt, final.pt
-- **Validation**: Every 2000 steps with IndicWhisper SR-FD metric
+## Key Features (v5)
+- **Universal Clean Dataset Support**: Native plug-and-play for **AI4Bharat Rasa** (Studio Expressive TTS) & **AI4Bharat IndicVoices-R** (Studio Read Speech).
+- **Auto-DDP Multi-GPU**: Auto-detects 4 GPUs across `python train.py` and `torchrun`.
+- **Gradient Accumulation**: Effective batch size 128 (8 per GPU × 4 GPUs × 4 accum) with ~9.5 GB VRAM per GPU.
+- **Length Regulation**: Duration predictor expands text features to match mel length.
+- **indic-nlp Normalizer**: Unicode normalization before character tokenization.
+- **Checkpointing**: `latest.pt`, `best.pt`, `step_N.pt`, `final.pt`.
+- **Validation**: Every 2000 steps with AI4Bharat IndicWhisper SR-FD metric.
 
-## How to Launch
+## Datasets Supported
+1. **AI4Bharat Rasa (Tamil Studio TTS)**:
+   - Kaggle Path: `/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil`
+   - Files: `train.parquet` (33,005 samples) + `test.parquet` (3,656 samples)
+   - Features: `text`, `audio`, `gender`, `style`, `duration`
+2. **AI4Bharat IndicVoices-R (Tamil Read Speech)**:
+   - Kaggle Path: `/kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil`
+   - Features: `normalized`, `text`, `audio`, `speaker_id`
+3. **AI4Bharat Shrutilipi (Tamil Broadcast)**:
+   - Kaggle Path: `/kaggle/input/datasets/ragunathravi/shrutilipi-tamil/tamil`
 
-### Multi-GPU (4x L4 / 4x T4) — Recommended
+## How to Launch on Kaggle
+
+### With Default Rasa Tamil Studio Dataset:
 ```bash
-torchrun --nproc_per_node=4 train.py \
-    --dataset_dir /kaggle/input/datasets/ragunathravi/shrutilipi-tamil/tamil \
-    --wavlm_dir /kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1 \
-    --whisper_dir /kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu
+!python train.py
 ```
 
-### Single GPU Fallback
+### With IndicVoices-R Tamil:
 ```bash
-python train.py \
-    --dataset_dir /kaggle/input/datasets/ragunathravi/shrutilipi-tamil/tamil \
-    --wavlm_dir /kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1 \
-    --whisper_dir /kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu
+!python train.py --dataset_dir /kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil
 ```
 
-### Kaggle Notebook Cell
-```python
-import os
-os.environ["DATASET"]  = "/kaggle/input/datasets/ragunathravi/shrutilipi-tamil/tamil"
-os.environ["WAVLM"]    = "/kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1"
-os.environ["WHISPER"]   = "/kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu"
-
-!torchrun --nproc_per_node=4 train.py \
-    --dataset_dir $DATASET --wavlm_dir $WAVLM --whisper_dir $WHISPER
+### With `torchrun`:
+```bash
+!torchrun --nproc_per_node=4 train.py --dataset_dir /kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil
 ```
 
 ## Architecture (68.55M)
 | Component | Params | Purpose |
 |---|---|---|
 | Text Encoder | 31.59M | 10-layer Transformer |
-| Style Encoder | 4.54M | Conv+GRU reference style |
-| Duration Predictor | 0.59M | Per-phoneme frame count |
-| Length Regulation | 0 | Expands text to mel length |
+| Style Encoder | 4.54M | Conv+GRU reference style extractor |
+| Duration Predictor | 0.59M | Per-phoneme frame count predictor |
+| Length Regulation | 0 | Dynamic feature expansion to mel length |
 | Diffusion Prosody | 14.30M | 8-block style-conditioned ResNet |
-| Vocoder | 17.50M | HiFi-GAN V1 |
-
-## GPU Memory Layout (DDP)
-| GPU | TamilTTS | WavLM | IndicWhisper | Activations | Total |
-|---|---|---|---|---|---|
-| GPU 0 | 0.27 GB | 0.36 GB | 0.6 GB | ~8 GB | ~9.2 GB |
-| GPU 1 | 0.27 GB | 0.36 GB | 0.6 GB | ~8 GB | ~9.2 GB |
-| GPU 2 | 0.27 GB | 0.36 GB | 0.6 GB | ~8 GB | ~9.2 GB |
-| GPU 3 | 0.27 GB | 0.36 GB | 0.6 GB | ~8 GB | ~9.2 GB |
+| Vocoder | 17.50M | HiFi-GAN V1 16kHz neural vocoder |

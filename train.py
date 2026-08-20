@@ -24,7 +24,7 @@ from transformers import WhisperModel, WhisperFeatureExtractor, WavLMModel
 from config import Config
 from models import TamilTTS
 from losses import SLMLoss, SRFDLoss
-from data import ShrutilipiDataset
+from data import TamilTTSDataset, load_dataset_splits
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
 from datasets import load_dataset
 
@@ -141,19 +141,17 @@ def train_worker(local_rank, world_size, cfg):
 
     # 5. Dataset & Distributed Samplers
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
-    log("Loading Shrutilipi dataset...", local_rank)
-    full_ds = load_dataset("parquet", data_dir=cfg.dataset_dir, split="train")
-    split = full_ds.train_test_split(test_size=cfg.val_split, seed=42)
+    train_raw, val_raw = load_dataset_splits(cfg.dataset_dir, val_split=cfg.val_split)
 
-    log(f"  Train samples       : {len(split['train'])}", local_rank)
-    log(f"  Val samples         : {len(split['test'])}", local_rank)
+    log(f"  Train samples       : {len(train_raw)}", local_rank)
+    log(f"  Val samples         : {len(val_raw)}", local_rank)
 
-    train_ds = ShrutilipiDataset(
-        split["train"], max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+    train_ds = TamilTTSDataset(
+        train_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
         mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
     )
-    val_ds = ShrutilipiDataset(
-        split["test"], max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
+    val_ds = TamilTTSDataset(
+        val_raw, max_audio_len=cfg.max_audio_len, max_text_len=cfg.max_text_len,
         mel_channels=cfg.mel_channels, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
     )
 

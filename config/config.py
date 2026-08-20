@@ -2,7 +2,7 @@
 
 class Config:
     # --- Paths ---
-    dataset_dir    = "/kaggle/input/datasets/ragunathravi/shrutilipi-tamil/tamil"
+    dataset_dir    = "/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil"
     wavlm_dir      = "/kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1"
     whisper_dir    = "/kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu"
     checkpoint_dir = "./checkpoints"
