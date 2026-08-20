@@ -1,16 +1,41 @@
-import random
+import re
 import torch
 import numpy as np
 import librosa
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
+from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+
+# Initialize Tamil normalizer once (module-level, shared across all workers)
+_tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
+
+# Regex to normalize subscript digits (₀-₉) to standard digits (0-9)
+_SUBSCRIPT_MAP = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+
+
+def normalize_tamil_text(text):
+    """
+    Clean Tamil text using indic-nlp-library + custom rules.
+    This runs BEFORE character tokenization.
+
+    What it does:
+    1. indic-nlp normalizer: fixes Unicode variations of Tamil chars,
+       removes zero-width joiners/non-joiners, standardizes punctuation
+    2. Subscript digits: ₀₁₂₃ -> 0123
+    3. Strip extra whitespace
+    """
+    text = _tamil_normalizer.normalize(text)
+    text = text.translate(_SUBSCRIPT_MAP)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 
 class ShrutilipiDataset(Dataset):
     """
     Shrutilipi Tamil dataset with:
-    - Corrupted audio error handling (skips bad samples)
+    - indic-nlp-library text normalization
+    - Corrupted audio: skips to next index (no random, no zeros)
     - Proper mel spectrogram extraction
-    - Tamil character tokenization
     """
     def __init__(self, hf_dataset, max_audio_len=48000, max_text_len=200,
                  mel_channels=80, n_fft=1024, hop_length=256, sr=16000):
@@ -23,37 +48,49 @@ class ShrutilipiDataset(Dataset):
         self.sr            = sr
         self.max_mel_len   = max_audio_len // hop_length  # 188
 
-        # Tamil Unicode character vocabulary
-        self.char2id = {" ": 1}
+        # Tamil Unicode character vocabulary (0x0B80-0x0BFF)
+        self.char2id = {" ": 1}  # 0=PAD, 1=SPACE
         idx = 2
         for c in range(0x0B80, 0x0C00):
             self.char2id[chr(c)] = idx
             idx += 1
+        # Digits (after normalizer converts subscripts)
+        for d in "0123456789":
+            self.char2id[d] = idx
+            idx += 1
+        # Common punctuation (important for prosody)
         for p in list(".,!?;:-"):
             self.char2id[p] = idx
             idx += 1
+        self.vocab_size = idx
 
     def __len__(self):
         return len(self.ds)
 
     def text_to_ids(self, text):
+        """Normalize with indic-nlp, then map each character to an ID."""
+        text = normalize_tamil_text(text)
         ids = [self.char2id.get(ch, 0) for ch in text]
         ids = ids[:self.max_text_len]
         ids += [0] * (self.max_text_len - len(ids))
         return ids
 
     def __getitem__(self, idx):
-        # Retry up to 5 times on corrupted audio
-        for attempt in range(5):
+        """
+        If a sample has corrupted audio, skip to the NEXT valid index.
+        No random sampling, no zero tensors.
+        """
+        total = len(self)
+        for offset in range(total):
+            actual_idx = (idx + offset) % total
             try:
-                actual_idx = idx if attempt == 0 else random.randint(0, len(self) - 1)
                 sample = self.ds[actual_idx]
 
-                # --- Text ---
+                # --- Text (with indic-nlp normalization) ---
                 text = sample["text"]
                 token_ids = torch.tensor(self.text_to_ids(text), dtype=torch.long)
 
-                # --- Audio (with error handling for corrupted files) ---
+                # --- Audio ---
                 audio_data = sample["audio_filepath"]
                 audio_array = np.array(audio_data["array"], dtype=np.float32)
                 sr = audio_data["sampling_rate"]
@@ -63,7 +100,7 @@ class ShrutilipiDataset(Dataset):
 
                 # Skip extremely short audio (< 0.1 seconds)
                 if len(audio_array) < 1600:
-                    raise ValueError("Audio too short")
+                    continue
 
                 # Pad or truncate
                 if len(audio_array) > self.max_audio_len:
@@ -91,14 +128,11 @@ class ShrutilipiDataset(Dataset):
                 return token_ids, mel_tensor, audio_tensor
 
             except Exception:
-                if attempt == 4:
-                    # Last resort: return zeros
-                    return (
-                        torch.zeros(self.max_text_len, dtype=torch.long),
-                        torch.zeros(self.mel_channels, self.max_mel_len),
-                        torch.zeros(self.max_audio_len),
-                    )
+                # This sample is corrupted, try next index
                 continue
+
+        # Should never reach here (would mean entire dataset is corrupt)
+        raise RuntimeError(f"Could not find any valid sample starting from index {idx}")
 
 
 def build_dataloaders(cfg):
