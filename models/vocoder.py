@@ -27,10 +27,9 @@ class FullVocoder(nn.Module):
 
     def forward(self, x):
         # x: [B, T_mel, 80]
-        x = self.conv_pre(x.transpose(1, 2))          # [B, 1024, T_mel]
-        x = self.res1(torch.relu(self.up1(x)))         # [B, 512,  T*8]
-        x = self.res2(torch.relu(self.up2(x)))         # [B, 256,  T*64]
-        x = self.res3(torch.relu(self.up3(x)))         # [B, 128,  T*128]
-        x = self.res4(torch.relu(self.up4(x)))         # [B, 64,   T*256]
-        x = torch.tanh(self.conv_post(x))              # [B, 1,    T_audio]
-        return x.squeeze(1)                            # [B, T_audio] ← FIXED
+        x = self.conv_pre(x.transpose(1, 2))
+        x = self.res1(torch.relu(self.up1(x)))
+        x = self.res2(torch.relu(self.up2(x)))
+        x = self.res3(torch.relu(self.up3(x)))
+        x = self.res4(torch.relu(self.up4(x)))
+        return torch.tanh(self.conv_post(x)).squeeze(1)  # [B, T_audio]

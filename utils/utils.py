@@ -4,15 +4,12 @@ import torch
 
 def save_checkpoint(model, optimizer, scheduler, step, loss, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    state = {
-        "step": step,
-        "loss": loss,
+    torch.save({
+        "step": step, "loss": loss,
         "model_state_dict": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-    }
-    torch.save(state, path)
-
+    }, path)
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -27,12 +24,10 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     print(f"  Resumed from step {ckpt['step']}, loss {ckpt['loss']:.4f}")
     return ckpt["step"]
 
-
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-
 
 def get_lr_scheduler(optimizer, warmup_steps, total_steps):
     def lr_lambda(step):

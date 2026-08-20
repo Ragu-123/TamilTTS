@@ -14,7 +14,6 @@ class StyleEncoder(nn.Module):
         self.proj = nn.Linear(hidden_dim, style_dim)
 
     def forward(self, mel):
-        # mel: [B, 80, T_mel]
-        x = self.convs(mel).transpose(1, 2)   # [B, T', 512]
-        _, h = self.rnn(x)                     # h: [1, B, 512]
-        return self.proj(h[-1])                # [B, 256]
+        x = self.convs(mel).transpose(1, 2)
+        _, h = self.rnn(x)
+        return self.proj(h[-1])
