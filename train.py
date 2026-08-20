@@ -136,40 +136,34 @@ def train_worker(local_rank, world_size, cfg):
     optimizer = Lion(model.parameters(), lr=cfg.learning_rate)
     scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
 
-    # 4. Critics (Dedicated copy per GPU)
+    # 4. Critics (Dedicated copy per GPU with low_cpu_mem_usage)
     log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
-    wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir).to(device)
+    wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir, low_cpu_mem_usage=True).to(device)
     slm_loss_fn = SLMLoss(wavlm)
 
     log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
-    whisper_enc = WhisperModel.from_pretrained(cfg.whisper_dir).encoder.to(device)
+    whisper_model = WhisperModel.from_pretrained(cfg.whisper_dir, low_cpu_mem_usage=True)
+    whisper_enc = whisper_model.encoder.to(device)
     whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
     srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext)
+    del whisper_model
+    import gc
+    gc.collect()
 
     # 5. Dataset & Distributed Samplers
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
-    if is_distributed:
-        if local_rank == 0:
-            train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
-        dist.barrier()  # Ranks 1-3 wait until Rank 0 completes caching
-        if local_rank != 0:
-            train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
-    else:
-        train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
+    train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
 
-    use_workers = cfg.num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.per_gpu_batch,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=cfg.num_workers,
-        pin_memory=True,
-        persistent_workers=use_workers,
-        prefetch_factor=2 if use_workers else None,
+        pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -178,9 +172,7 @@ def train_worker(local_rank, world_size, cfg):
         shuffle=False,
         sampler=val_sampler,
         num_workers=cfg.num_workers,
-        pin_memory=True,
-        persistent_workers=use_workers,
-        prefetch_factor=2 if use_workers else None,
+        pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
 
