@@ -1,23 +1,25 @@
 """
-TamilTTS Inference Script — v4 (SOTA AI4Bharat / Kokoro Architecture)
+TamilTTS Inference Script — v5 (SOTA AI4Bharat / Kokoro Architecture)
 =====================================================================
-Generates clean, natural, buzz-free Tamil speech audio from text using trained TamilTTS checkpoint.
+Generates natural, expressive Tamil speech audio from text using trained TamilTTS checkpoint.
 
 Features:
-- Character-level Tamil Unicode tokenization with safety boundary clamping.
+- Natural duration pacing directly from learned DurationPredictor (no artificial frame clamping).
+- Reference voice extraction for zero-shot voice cloning and natural expressive intonation.
 - PostNet 5-layer convolutional formant refinement.
-- Monotonic Alignment Search (MAS) duration pacing.
-- Mel-scale normalized reference audio extraction for zero-shot voice cloning.
 - Pre-trained Frozen Universal HiFi-GAN Vocoder integration.
-- Fine-grained speed and duration control (--speed, --min_char_frames).
+- Speed scaling (--speed) and pitch/style conditioning (--ref_audio).
 
 Usage:
+    # 1. Voice Cloning (Recommended: use any clean Tamil WAV audio as voice reference)
+    python inference.py --text "வணக்கம், நான் தமிழில் பேசுகிறேன்." --checkpoint ./checkpoints/best.pt --ref_audio sample.wav
+
+    # 2. Default Synthesis
     python inference.py --text "வணக்கம், நான் தமிழில் பேசுகிறேன்." --checkpoint ./checkpoints/best.pt
-    python inference.py --text "வணக்கம்" --checkpoint ./checkpoints/best.pt --speed 1.0 --output out.wav
-    python inference.py --text "வணக்கம்" --checkpoint ./checkpoints/best.pt --ref_audio sample.wav
 """
 import argparse
 import os
+import glob
 import re
 import torch
 import numpy as np
@@ -81,15 +83,24 @@ def text_to_ids(text, char2id, max_text_len=200, max_vocab_size=256):
     return ids
 
 
+def compute_mel_from_audio(audio_path, cfg):
+    """Computes clamped log-mel spectrogram matching Kokoro/HiFi-GAN scale."""
+    audio_ref, sr = librosa.load(audio_path, sr=cfg.sample_rate)
+    mel = librosa.feature.melspectrogram(
+        y=audio_ref, sr=cfg.sample_rate, n_fft=cfg.n_fft,
+        hop_length=cfg.hop_length, n_mels=cfg.mel_channels,
+        fmin=0.0, fmax=8000.0,
+    )
+    mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
+    mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)
+    return mel_log, len(audio_ref) / sr
+
+
 @torch.no_grad()
 def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
-               max_text_len=200, speed=1.0, min_frames_per_char=5.0,
-               external_vocoder=None):
+               max_text_len=200, speed=1.0, external_vocoder=None):
     """
-    Generate speech audio from Tamil text.
-    
-    speed: Speed factor. 1.0 = normal speed, 0.8 = slower/clearer, 1.2 = faster.
-    min_frames_per_char: Minimum mel frames per character (default: 5.0 = ~80ms per character).
+    Generate speech audio from Tamil text using learned durations and acoustic projections.
     """
     # 1. Tokenize text with safe vocab clamping
     token_ids = text_to_ids(text, char2id, max_text_len, max_vocab_size=vocab_size)
@@ -98,8 +109,8 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
 
     # 2. Reference mel for style extraction (Natural Log-Mel scale)
     if ref_mel is None:
-        # Default: True acoustic silence (ln(1e-5) = -11.51)
-        ref_mel = torch.full((1, 80, 50), -11.5, device=device)
+        # Generate a standard acoustic reference frame distribution
+        ref_mel = torch.full((1, 80, 50), -3.5, device=device)
     elif ref_mel.dim() == 2:
         ref_mel = ref_mel.unsqueeze(0)
     ref_mel = ref_mel.to(device)
@@ -108,18 +119,17 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     eval_model = model.module if hasattr(model, "module") else model
     eval_model.eval()
 
-    # Step A: Text encoding with pad mask
+    # Step A: Text encoding with Sinusoidal Positional Encoding & pad mask
     style = eval_model.style_encoder(ref_mel)
     x = eval_model.text_encoder(tokens, mask=text_mask)
 
-    # Step B: Duration prediction with speed scaling
+    # Step B: Duration prediction directly from learned predictor
     dur_pred, log_dur_pred = eval_model.duration_predictor(x, mask=text_mask)  # [1, T_text]
 
-    # Apply speed and ensure minimum frames for proper syllable articulation
+    # Apply user speed scaling (1.0 = normal, 0.8 = slower, 1.2 = faster)
     non_pad = (~text_mask).float()
     dur_scaled = dur_pred * (1.0 / max(speed, 0.1))
-    dur_scaled = torch.maximum(dur_scaled, non_pad * min_frames_per_char)
-    dur_scaled = dur_scaled * non_pad
+    dur_scaled = torch.clamp(dur_scaled, min=1.0) * non_pad  # Minimum 1 frame per character
 
     total_frames = int(torch.round(dur_scaled).sum().item())
     total_frames = max(total_frames, 16)
@@ -152,14 +162,12 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (v4 — SOTA Architecture)")
+    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (v5 — SOTA Architecture)")
     parser.add_argument("--text", type=str, required=True, help="Tamil text to synthesize")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (best.pt)")
     parser.add_argument("--output", type=str, default="output_tamil.wav", help="Output WAV file path")
-    parser.add_argument("--ref_audio", type=str, default=None, help="Optional: reference audio WAV for voice cloning")
+    parser.add_argument("--ref_audio", type=str, default=None, help="Optional: reference audio WAV for voice cloning / speaker pitch")
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed (default: 1.0, 0.85=slower/clearer)")
-    parser.add_argument("--min_char_frames", type=float, default=5.0,
-                        help="Minimum mel frames per character (default: 5.0 = ~80ms per character)")
     parser.add_argument("--vocoder_ckpt", type=str, default=None,
                         help="Path to pre-trained universal HiFi-GAN vocoder checkpoint")
     args = parser.parse_args()
@@ -168,7 +176,7 @@ def main():
     cfg = Config()
 
     print("=" * 60)
-    print("  TamilTTS Inference Pipeline (v4 — SOTA Architecture)")
+    print("  TamilTTS Inference Pipeline (v5 — SOTA Architecture)")
     print("=" * 60)
     print(f"  Device     : {device}")
     print(f"  Checkpoint : {args.checkpoint}")
@@ -197,16 +205,17 @@ def main():
     # 4. Optional voice cloning reference audio
     ref_mel = None
     if args.ref_audio and os.path.exists(args.ref_audio):
-        audio_ref, sr = librosa.load(args.ref_audio, sr=cfg.sample_rate)
-        mel = librosa.feature.melspectrogram(
-            y=audio_ref, sr=cfg.sample_rate, n_fft=cfg.n_fft,
-            hop_length=cfg.hop_length, n_mels=cfg.mel_channels,
-            fmin=0.0, fmax=8000.0,
-        )
-        mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
-        mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)
+        mel_log, ref_dur = compute_mel_from_audio(args.ref_audio, cfg)
         ref_mel = torch.tensor(mel_log, dtype=torch.float32, device=device).unsqueeze(0)
-        print(f"  Ref Voice  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
+        print(f"  Ref Voice  : {args.ref_audio} ({ref_dur:.1f}s)")
+    else:
+        # Check if any sample audio exists in dataset for natural default voice
+        sample_audio_candidates = glob.glob("/kaggle/input/datasets/**/*.wav", recursive=True) or glob.glob("./*.wav")
+        if sample_audio_candidates and os.path.exists(sample_audio_candidates[0]):
+            sample_file = sample_audio_candidates[0]
+            mel_log, ref_dur = compute_mel_from_audio(sample_file, cfg)
+            ref_mel = torch.tensor(mel_log, dtype=torch.float32, device=device).unsqueeze(0)
+            print(f"  Default Ref: Using dataset voice {os.path.basename(sample_file)} ({ref_dur:.1f}s)")
 
     # 5. Load pre-trained Universal Vocoder
     vocoder_path = args.vocoder_ckpt or cfg.vocoder_ckpt
@@ -219,7 +228,6 @@ def main():
         vocab_size=ckpt_vocab_size,
         ref_mel=ref_mel,
         speed=args.speed,
-        min_frames_per_char=args.min_char_frames,
         external_vocoder=external_vocoder,
     )
 
