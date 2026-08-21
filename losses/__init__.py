@@ -1,1 +1,1 @@
-from .losses import DualMelLoss, LogDurationLoss, CTCAlignmentLoss, SLMLoss, SRFDLoss
+from .losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss

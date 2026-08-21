@@ -1,11 +1,11 @@
 """
-TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / Kokoro SOTA Standard)
-====================================================================================
+TamilTTS Acoustic Model Architecture (FastPitch / RAD-TTS SOTA Standard)
+=========================================================================
 - TextEncoder: Transformer with Sinusoidal Positional Encoding & Pad Masking.
 - StyleEncoder: Extracts reference speaker voice embedding for zero-shot voice cloning.
-- AlignmentModule: CTC-supervised Conv1D alignment head for mathematically grounded text-to-mel alignment.
-- DurationPredictor: Learns log-durations from CTC alignment targets.
-- DiffusionProsody: FiLM-modulated style and prosody latent adaptation.
+- AlignmentNetwork: RAD-TTS / FastPitch attention aligner trained with Forward-Sum & Binarization Loss.
+- DurationPredictor: Dilated Conv1D log-duration predictor trained on alignment-derived durations.
+- DiffusionProsody: FiLM-modulated prosody & style latent modulation.
 - AcousticProj + PostNet: Dual Mel-Spectrogram generator (coarse + 5-layer refined at 22.05 kHz).
 - FullVocoder: Frozen Universal HiFi-GAN Vocoder (22.05 kHz output).
 """
@@ -18,7 +18,7 @@ from .duration_predictor import DurationPredictor
 from .diffusion import DiffusionProsody
 from .postnet import PostNet
 from .vocoder import FullVocoder
-from .alignment import AlignmentModule, extract_alignment_durations
+from .alignment import AlignmentNetwork
 
 
 def length_regulate(x, durations, max_len=None):
@@ -71,10 +71,10 @@ class TamilTTS(nn.Module):
             hidden_dim=cfg.hidden_dim,
             style_dim=cfg.style_dim,
         )
-        self.aligner = AlignmentModule(
-            mel_channels=cfg.mel_channels,
-            hidden_dim=256,
-            vocab_size=self.vocab_size,
+        self.aligner = AlignmentNetwork(
+            text_dim=cfg.hidden_dim,
+            mel_dim=cfg.mel_channels,
+            attn_dim=getattr(cfg, "aligner_dim", 128),
         )
         self.duration_predictor = DurationPredictor(
             hidden_dim=cfg.hidden_dim,
@@ -92,7 +92,7 @@ class TamilTTS(nn.Module):
             nn.Linear(cfg.hidden_dim // 2, cfg.mel_channels),
         )
 
-        # Kokoro / Tacotron 2 PostNet for Formant & Harmonic Refinement
+        # Kokoro / Tacotron 2 5-layer PostNet for Formant & Harmonic Refinement
         self.postnet = PostNet(
             mel_dim=cfg.mel_channels,
             postnet_dim=512,
@@ -110,64 +110,75 @@ class TamilTTS(nn.Module):
             in_channels=cfg.mel_channels,
             upsample_initial_channel=512,
         )
-        self.max_mel_len = cfg.max_mel_len
 
-    def forward(self, text_tokens, ref_mel, target_mel_len=None, text_mask=None, target_dur=None):
+    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None):
         """
-        text_tokens:    [B, T_text]
-        ref_mel:        [B, 80, T_mel]
-        target_mel_len: int (optional target frame count)
-        text_mask:      [B, T_text] boolean mask (True = PAD)
-        target_dur:     [B, T_text] (explicit durations, if provided)
-        
+        text_tokens: [B, T_text]
+        text_lens:   [B] (actual token lengths)
+        ref_mel:     [B, 80, T_mel] (optional during inference)
+        mel_lens:    [B] (actual mel frame lengths)
+        target_dur:  [B, T_text] (explicit durations, if provided)
+
         Returns:
-            audio:        [B, T_audio] (synthesized waveform via vocoder)
-            mel_refined:  [B, mel_len, 80] (final post-PostNet mel spectrogram)
-            mel_coarse:   [B, mel_len, 80] (raw decoder mel prediction)
-            dur_pred:     [B, T_text] (predicted linear duration in frames)
-            log_dur_pred: [B, T_text] (predicted log-durations for loss)
-            ctc_log_probs:[T_mel, B, vocab_size] (for CTC alignment loss)
-            align_dur:    [B, T_text] (ground-truth duration from alignment)
+            audio:            [B, T_audio] (synthesized waveform)
+            mel_refined:      [B, mel_len, 80] (post-PostNet mel spectrogram)
+            mel_coarse:       [B, mel_len, 80] (pre-PostNet mel prediction)
+            dur_pred:         [B, T_text] (predicted linear duration)
+            log_dur_pred:     [B, T_text] (predicted log-duration)
+            align_dur:        [B, T_text] (alignment-derived duration targets)
+            forward_sum_loss: scalar tensor (from RAD-TTS aligner)
+            bin_loss:         scalar tensor (from RAD-TTS aligner)
         """
+        B, T_text = text_tokens.shape
+        device = text_tokens.device
+
+        text_mask = torch.arange(T_text, device=device).unsqueeze(0) >= text_lens.unsqueeze(1)  # True = PAD
+
         # 1. Extract speaker style embedding from reference mel
-        style = self.style_encoder(ref_mel)                          # [B, 256]
+        if ref_mel is not None:
+            style = self.style_encoder(ref_mel)
+        else:
+            dummy_mel = torch.full((B, 80, 50), -3.5, device=device)
+            style = self.style_encoder(dummy_mel)
 
         # 2. Encode text with self-attention, positional encoding, and pad masking
-        x = self.text_encoder(text_tokens, mask=text_mask)           # [B, T_text, 512]
+        x = self.text_encoder(text_tokens, mask=text_mask)  # [B, T_text, 512]
 
-        # 3. Supervised CTC Alignment
-        ctc_logits, ctc_log_probs = self.aligner(ref_mel)            # logits: [B, vocab, T_mel], log_probs: [T_mel, B, vocab]
-
-        # 4. Predict durations for each character
+        # 3. Predict durations for each character
         dur_pred, log_dur_pred = self.duration_predictor(x, mask=text_mask)  # [B, T_text]
 
-        # 5. Determine durations for length regulation:
-        if self.training and target_dur is None and ref_mel is not None:
-            align_dur, _ = extract_alignment_durations(text_tokens, ctc_logits, text_mask=text_mask)
+        # 4. Alignment & Duration Assignment:
+        forward_sum_loss = torch.tensor(0.0, device=device)
+        bin_loss = torch.tensor(0.0, device=device)
+
+        if self.training and ref_mel is not None and mel_lens is not None:
+            # Learned RAD-TTS Alignment Network
+            align_dur, hard_path, forward_sum_loss, bin_loss = self.aligner(x, ref_mel, text_lens, mel_lens)
             durations = align_dur
-            mel_len = target_mel_len if target_mel_len else ref_mel.size(2)
+            mel_len = int(mel_lens.max().item())
         elif target_dur is not None:
             align_dur = target_dur
             durations = target_dur
-            mel_len = target_mel_len if target_mel_len else (ref_mel.size(2) if ref_mel is not None else self.max_mel_len)
+            mel_len = int(durations.sum(dim=1).max().item())
         else:
             align_dur = dur_pred
-            durations = dur_pred
-            total_dur = int(torch.clamp(torch.round(dur_pred), min=0).sum(dim=1).max().item())
-            mel_len = target_mel_len if target_mel_len else max(total_dur, 16)
+            dur_rounded = torch.clamp(torch.round(dur_pred), min=1.0) * (~text_mask).float()
+            durations = dur_rounded
+            total_dur = int(dur_rounded.sum(dim=1).max().item())
+            mel_len = max(total_dur, 16)
 
-        # 6. Length Regulation
+        # 5. Length Regulation
         x_expanded = length_regulate(x, durations, max_len=mel_len)  # [B, mel_len, 512]
 
-        # 7. Modulate prosody & style
+        # 6. Modulate prosody & style
         latents = self.diffusion_prosody(x_expanded, style)          # [B, mel_len, 512]
 
-        # 8. Predict Coarse & Refined 80-channel Mel Spectrogram (22.05 kHz)
+        # 7. Predict Coarse & Refined 80-channel Mel Spectrogram (22.05 kHz)
         mel_coarse = self.acoustic_proj(latents)                     # [B, mel_len, 80]
         mel_residual = self.postnet(mel_coarse)                      # [B, mel_len, 80]
         mel_refined = mel_coarse + mel_residual                      # [B, mel_len, 80]
 
-        # 9. Synthesize waveform via Vocoder
+        # 8. Synthesize waveform via Vocoder
         audio = self.vocoder(mel_refined)                            # [B, T_audio]
 
-        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, ctc_log_probs, align_dur
+        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, forward_sum_loss, bin_loss

@@ -1,10 +1,8 @@
 """
-TamilTTS Inference Script — v6 (Natural Speech Pacing & Voice Cloning)
-======================================================================
-Generates natural, human-paced Tamil speech audio using trained checkpoint and voice reference.
-
+TamilTTS Inference Script — Pure Learned Durations & Voice Cloning (FastPitch SOTA Standard)
+============================================================================================
 Features:
-- Natural Speech Pacing (auto-scales early checkpoints to natural 80-110ms per Tamil syllable).
+- Pure Learned Duration Synthesis (Timing governed directly by trained DurationPredictor).
 - Zero-Shot Voice Cloning via Reference Audio (--ref_audio).
 - PostNet 5-layer harmonic formant refinement.
 - Pre-trained Frozen Universal HiFi-GAN Vocoder (22.05 kHz output).
@@ -19,16 +17,20 @@ import librosa
 from config import Config
 from models import TamilTTS
 from models.vocoder import load_pretrained_vocoder
-from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+try:
+    from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+    _tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
+except ImportError:
+    _tamil_normalizer = None
 
-_tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
 _SUBSCRIPT_MAP = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
 
 
 def normalize_tamil_text(text):
     if not isinstance(text, str):
         return ""
-    text = _tamil_normalizer.normalize(text)
+    if _tamil_normalizer is not None:
+        text = _tamil_normalizer.normalize(text)
     text = text.translate(_SUBSCRIPT_MAP)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -52,21 +54,15 @@ def build_char2id(max_vocab_size=256):
     return char2id
 
 
-def text_to_ids(text, char2id, max_text_len=200, max_vocab_size=256):
+def text_to_ids(text, char2id, max_vocab_size=256):
     text = normalize_tamil_text(text)
-    ids = []
-    for ch in text:
-        token_id = char2id.get(ch, 0)
-        if token_id >= max_vocab_size:
-            token_id = 0
-        ids.append(token_id)
-    ids = ids[:max_text_len]
-    ids += [0] * (max_text_len - len(ids))
+    ids = [char2id.get(ch, 0) for ch in text]
+    ids = [min(i, max_vocab_size - 1) for i in ids if i > 0]
     return ids
 
 
-def compute_mel_from_audio(audio_path, target_sr=16000, n_fft=1024, hop_length=256, n_mels=80):
-    """Computes clamped log-mel spectrogram matching Kokoro/HiFi-GAN scale."""
+def compute_mel_from_audio(audio_path, target_sr=22050, n_fft=1024, hop_length=256, n_mels=80):
+    """Computes clamped natural log-mel spectrogram matching 22.05kHz HiFi-GAN scale."""
     audio_ref, sr = librosa.load(audio_path, sr=target_sr)
     mel = librosa.feature.melspectrogram(
         y=audio_ref, sr=target_sr, n_fft=n_fft,
@@ -79,20 +75,17 @@ def compute_mel_from_audio(audio_path, target_sr=16000, n_fft=1024, hop_length=2
 
 
 @torch.no_grad()
-def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
-               max_text_len=200, speed=1.0, frames_per_char=6.0,
-               external_vocoder=None):
+def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None, speed=1.0, external_vocoder=None):
     """
-    Synthesize natural-speed Tamil speech audio.
-    
-    frames_per_char: Target frames per Tamil character (default: 6.0 frames = ~96ms per letter).
-                     For a 35-char sentence, this produces a natural ~3.3 second utterance.
+    Synthesize natural Tamil speech audio from purely learned duration representations.
     """
-    token_ids = text_to_ids(text, char2id, max_text_len, max_vocab_size=vocab_size)
-    tokens = torch.tensor([token_ids], dtype=torch.long, device=device)
-    text_mask = (tokens == 0)
-    non_pad = (~text_mask).float()
-    num_chars = int(non_pad.sum().item())
+    ids = text_to_ids(text, char2id, max_vocab_size=vocab_size)
+    if len(ids) == 0:
+        ids = [1]
+
+    text_lens = torch.tensor([len(ids)], dtype=torch.long, device=device)
+    tokens = torch.tensor([ids], dtype=torch.long, device=device)
+    text_mask = torch.zeros(1, len(ids), dtype=torch.bool, device=device)
 
     # Reference mel for voice style
     if ref_mel is None:
@@ -108,30 +101,20 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     style = eval_model.style_encoder(ref_mel)
     x = eval_model.text_encoder(tokens, mask=text_mask)
 
-    # Step B: Duration prediction & Human Speech Pacing
-    dur_pred, _ = eval_model.duration_predictor(x, mask=text_mask)
+    # Step B: Pure learned duration prediction
+    dur_pred, _ = eval_model.duration_predictor(x, mask=text_mask)  # [1, T_text]
 
-    # Check if duration predictor has learned full scaling (early checkpoints predict ~1 frame)
-    avg_pred = (dur_pred * non_pad).sum() / max(num_chars, 1)
-    if avg_pred.item() < 3.5:
-        # Scale to natural human Tamil speech cadence (~6.0 frames per character)
-        pace_scale = (frames_per_char / max(avg_pred.item(), 0.5)) * (1.0 / max(speed, 0.1))
-        dur_scaled = dur_pred * pace_scale
-    else:
-        dur_scaled = dur_pred * (1.0 / max(speed, 0.1))
-
-    # Ensure minimum 3 frames for vowels/consonants and zero for pad
-    dur_scaled = torch.clamp(dur_scaled, min=3.0) * non_pad
-
-    total_frames = int(torch.round(dur_scaled).sum().item())
-    total_frames = max(total_frames, 32)
+    # Apply speed scaling (1.0 = normal, 0.85 = slower/clearer, 1.2 = faster)
+    dur_scaled = dur_pred * (1.0 / max(speed, 0.1))
+    dur_rounded = torch.clamp(torch.round(dur_scaled), min=1.0)
+    total_frames = int(dur_rounded.sum().item())
+    total_frames = max(total_frames, 16)
 
     # Forward through model using regulated durations
-    audio, mel_refined, mel_coarse, _, _, _, _ = eval_model(
-        tokens, ref_mel,
-        target_mel_len=total_frames,
-        text_mask=text_mask,
-        target_dur=dur_scaled
+    audio, mel_refined, mel_coarse, _, _, _, _, _ = eval_model(
+        tokens, text_lens,
+        ref_mel=ref_mel,
+        target_dur=dur_rounded,
     )
 
     # Vocoder waveform synthesis
@@ -151,14 +134,12 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (v6 — Natural Speech Pacing)")
+    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (Pure Learned Durations)")
     parser.add_argument("--text", type=str, required=True, help="Tamil text to synthesize")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (best.pt)")
     parser.add_argument("--output", type=str, default="output_tamil.wav", help="Output WAV file path")
     parser.add_argument("--ref_audio", type=str, default=None, help="Reference audio WAV for speaker voice cloning")
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed (1.0 = normal, 0.85 = slower/clearer)")
-    parser.add_argument("--pace", type=float, default=6.0,
-                        help="Target mel frames per Tamil character (default: 6.0 = ~96ms per letter / natural human pace)")
     parser.add_argument("--vocoder_ckpt", type=str, default=None,
                         help="Path to pre-trained universal HiFi-GAN vocoder checkpoint")
     args = parser.parse_args()
@@ -167,12 +148,12 @@ def main():
     cfg = Config()
 
     print("=" * 60)
-    print("  TamilTTS Inference Pipeline (v6 — Natural Speech Pacing)")
+    print("  TamilTTS Inference Pipeline (FastPitch / Pure Learned Durations)")
     print("=" * 60)
     print(f"  Device     : {device}")
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Text       : {args.text}")
-    print(f"  Speed      : {args.speed}x | Target Pace: {args.pace} frames/char")
+    print(f"  Speed      : {args.speed}x")
 
     # 1. Match vocab size from checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -199,35 +180,31 @@ def main():
         ref_mel = torch.tensor(mel_log, dtype=torch.float32, device=device).unsqueeze(0)
         print(f"  Voice Ref  : {args.ref_audio} ({ref_dur:.1f}s)")
     else:
-        print("  Voice Ref  : Default Natural Acoustic Distribution")
+        print("  Voice Ref  : Neutral Acoustic Distribution")
 
     # 4. Load Vocoder
     vocoder_path = args.vocoder_ckpt or cfg.vocoder_ckpt
     external_vocoder = load_pretrained_vocoder(device=device, checkpoint_path=vocoder_path)
 
     # 5. Synthesize
-    print("\n  Generating natural-paced speech audio...")
+    print("\n  Generating speech audio...")
     audio_np, mel_np = synthesize(
         model, args.text, char2id, device,
         vocab_size=ckpt_vocab_size,
         ref_mel=ref_mel,
         speed=args.speed,
-        frames_per_char=args.pace,
         external_vocoder=external_vocoder,
     )
 
-    # 6. Save Audio
-    # HiFi-GAN V1 outputs audio at 22,050 Hz (256x upsampling of 80 mel frames)
-    # or 16,000 Hz depending on native training sample rate
-    output_sr = 22050 if cfg.sample_rate == 22050 or "indic_tts" in str(vocoder_path) else cfg.sample_rate
+    # 6. Save Audio at 22,050 Hz
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-    sf.write(args.output, audio_np, output_sr)
-    duration = len(audio_np) / output_sr
+    sf.write(args.output, audio_np, cfg.sample_rate)
+    duration = len(audio_np) / cfg.sample_rate
 
     print(f"\n  ✅ Speech Generated Successfully!")
     print(f"  Output File: {args.output}")
-    print(f"  Duration   : {duration:.2f} seconds (Natural Human Speed)")
-    print(f"  Sample Rate: {output_sr} Hz")
+    print(f"  Duration   : {duration:.2f} seconds")
+    print(f"  Sample Rate: {cfg.sample_rate} Hz")
     print(f"  Audio Shape: {audio_np.shape}")
     print("=" * 60)
 

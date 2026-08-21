@@ -1,7 +1,9 @@
-"""TamilTTS Configuration — SOTA Decoupled Acoustic + Frozen 22.05kHz HiFi-GAN Pipeline."""
+"""
+TamilTTS Configuration — FastPitch + RAD-TTS Alignment + Frozen 22.05kHz HiFi-GAN Pipeline.
+"""
 
 class Config:
-    # --- Paths (Supports single path or list of paths for multi-dataset combination) ---
+    # --- Paths ---
     dataset_dir = [
         "/kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil",
         "/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil",
@@ -23,28 +25,32 @@ class Config:
     mel_channels             = 80
     diffusion_blocks         = 8
     duration_filter_channels = 256
+    aligner_dim              = 128
     vocoder_initial_channels = 512
 
     # --- Audio (22.05 kHz Standard for HiFi-GAN V1) ---
     sample_rate   = 22050
     n_fft         = 1024
     hop_length    = 256
-    max_audio_len = 66150   # 3.0 seconds @ 22.05kHz
-    max_text_len  = 200
-    max_mel_len   = 258     # max_audio_len / hop_length
+    f_min         = 0.0
+    f_max         = 8000.0
+    min_audio_len = 11025   # 0.5 seconds @ 22.05kHz
+    max_audio_len = 220500  # 10.0 seconds @ 22.05kHz
+    max_text_len  = 250
 
-    # --- Training ---
+    # --- Training Parameters ---
     total_steps      = 100_000
     per_gpu_batch    = 8
     grad_accum_steps = 4
     num_workers      = 4
-    learning_rate    = 1e-3     # AdamW with 1e-3 peak LR
+    learning_rate    = 1.5e-4   # FastPitch / StyleTTS2 standard LR
     warmup_steps     = 2_000
     save_every       = 2_000
 
-    # --- Loss Weights ---
-    weight_mel_refined = 1.0     # PostNet refined mel loss
-    weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss
-    weight_dur         = 0.02    # Log-scale duration loss
-    weight_slm         = 1.0     # Perceptual WavLM speech language model critic
-    weight_align       = 0.5     # Supervised CTC text-to-mel alignment loss
+    # --- Loss Weights (Staged Training) ---
+    weight_mel_refined = 1.0     # PostNet refined mel loss (Masked L1)
+    weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss (Masked L1)
+    weight_dur         = 0.1     # Duration MSE loss on alignment-derived durations
+    weight_align       = 1.0     # RAD-TTS Forward-Sum Alignment Loss
+    weight_bin         = 0.1     # Binarization loss for sharp alignments
+    weight_slm         = 0.0     # Stage 1: 0.0 (Stage 2 after step 10k: 0.1)

@@ -1,8 +1,10 @@
 """
-Monotonic Alignment Search & CTC Alignment Module
-=================================================
-Provides supervised alignment between Tamil text characters and 22.05kHz mel frames
-using a Convolutional Alignment Head supervised via PyTorch CTC Loss.
+RAD-TTS / FastPitch Alignment Network
+====================================
+Based on 'One TTS Alignment To Rule Them All' (Badlani et al., NVIDIA / NeMo FastPitch).
+Computes a soft attention alignment matrix between text representations and mel frames,
+trained using Forward-Sum Loss and Binarization Loss.
+Extracts mathematically grounded, alignment-derived durations per character via Viterbi / MAS.
 """
 import torch
 import torch.nn as nn
@@ -10,39 +12,13 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class AlignmentModule(nn.Module):
-    """
-    Acoustic-to-Text Alignment Network (FastPitch / RAD-TTS standard).
-    Projects 80-channel mel frames to character vocabulary distribution.
-    Supervised via CTC Loss to guarantee grounded phoneme-to-frame alignment.
-    """
-    def __init__(self, mel_channels=80, hidden_dim=256, vocab_size=256):
-        super().__init__()
-        self.conv1 = nn.Conv1d(mel_channels, hidden_dim, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, hidden_dim)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, hidden_dim)
-        self.proj = nn.Conv1d(hidden_dim, vocab_size, 1)
-
-    def forward(self, mel):
-        """
-        mel: [B, 80, T_mel]
-        Returns:
-            logits: [B, vocab_size, T_mel]
-            log_probs: [T_mel, B, vocab_size] for torch.nn.functional.ctc_loss
-        """
-        h = F.leaky_relu(self.norm1(self.conv1(mel)), 0.1)
-        h = F.leaky_relu(self.norm2(self.conv2(h)), 0.1)
-        logits = self.proj(h)  # [B, vocab_size, T_mel]
-        log_probs = F.log_softmax(logits.permute(2, 0, 1), dim=-1)  # [T_mel, B, vocab_size]
-        return logits, log_probs
-
-
 def maximum_path_numpy(value, mask, max_neg_val=-1e9):
     """
     Fast Dynamic Programming for Monotonic Alignment Search.
-    value: [B, T_text, T_mel] — log-likelihood matrix
-    mask:  [B, T_text, T_mel] — boolean mask
+    value: [B, T_text, T_mel] — log-likelihood / energy matrix
+    mask:  [B, T_text, T_mel] — boolean mask (True for valid region)
+    Returns:
+    path:  [B, T_text, T_mel] — binary matrix with 1.0 along the optimal monotonic path
     """
     B, T_text, T_mel = value.shape
     path = np.zeros((B, T_text, T_mel), dtype=np.float32)
@@ -78,44 +54,88 @@ def maximum_path_numpy(value, mask, max_neg_val=-1e9):
     return path
 
 
-def extract_alignment_durations(text_tokens, ctc_logits, text_mask=None):
+class AlignmentNetwork(nn.Module):
     """
-    Extracts true frame counts per character from CTC alignment posterior.
+    Learned Text-to-Mel Alignment Network (RAD-TTS / FastPitch Standard).
     
-    text_tokens: [B, T_text]
-    ctc_logits:  [B, vocab_size, T_mel]
-    text_mask:   [B, T_text] (True for PAD)
-    
-    Returns:
-        durations: [B, T_text] — number of mel frames per character
+    1. Projects text embeddings and mel features to a shared attention space.
+    2. Computes pairwise energy: E = (T_proj * M_proj^T) / sqrt(D).
+    3. Calculates Forward-Sum Loss (all valid monotonic alignments log-probability sum).
+    4. Calculates Binarization Loss to enforce sharp, unambiguous character boundaries.
+    5. Extracts exact alignment-derived durations per character via Viterbi MAS.
     """
-    device = text_tokens.device
-    B, T_text = text_tokens.shape
-    T_mel = ctc_logits.shape[2]
+    def __init__(self, text_dim=512, mel_dim=80, attn_dim=128):
+        super().__init__()
+        self.text_proj = nn.Linear(text_dim, attn_dim)
+        self.mel_conv = nn.Sequential(
+            nn.Conv1d(mel_dim, attn_dim, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(attn_dim, attn_dim, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(attn_dim, attn_dim, 1),
+        )
+        self.scale = attn_dim ** 0.5
 
-    # Gather log-probabilities for the actual text tokens across all mel frames
-    log_probs = F.log_softmax(ctc_logits, dim=1)  # [B, vocab_size, T_mel]
-    
-    # Expand text tokens to gather from log_probs: [B, T_text, T_mel]
-    tokens_expanded = text_tokens.unsqueeze(-1).expand(-1, -1, T_mel)  # [B, T_text, T_mel]
-    
-    # Gather emission log-likelihood: [B, T_text, T_mel]
-    # For each batch item, gather probabilities of each character across time
-    sim = torch.gather(log_probs, 1, tokens_expanded)  # [B, T_text, T_mel]
+    def forward(self, text_emb, mel, text_lens, mel_lens):
+        """
+        text_emb:  [B, T_text, text_dim]
+        mel:       [B, mel_dim, T_mel]
+        text_lens: [B] (actual character lengths per sample)
+        mel_lens:  [B] (actual mel frame lengths per sample)
 
-    # Create joint mask
-    if text_mask is not None:
-        t_mask = (~text_mask).unsqueeze(2).expand(-1, -1, T_mel)  # [B, T_text, T_mel]
-    else:
-        t_mask = torch.ones(B, T_text, T_mel, dtype=torch.bool, device=device)
+        Returns:
+            durations:        [B, T_text] (exact alignment-derived frame counts per token)
+            hard_path:        [B, T_text, T_mel] (binary alignment path)
+            forward_sum_loss: scalar tensor (Forward-Sum Loss)
+            bin_loss:         scalar tensor (Binarization Loss)
+        """
+        B, T_text, _ = text_emb.shape
+        T_mel = mel.shape[2]
+        device = text_emb.device
 
-    sim_np = sim.detach().cpu().numpy()
-    mask_np = t_mask.cpu().numpy()
+        # 1. Project representations to alignment attention space
+        t_proj = self.text_proj(text_emb)               # [B, T_text, attn_dim]
+        m_proj = self.mel_conv(mel).transpose(1, 2)     # [B, T_mel, attn_dim]
 
-    # Dynamic Programming MAS
-    path_np = maximum_path_numpy(sim_np, mask_np)
-    path = torch.from_numpy(path_np).to(device)
+        # 2. Pairwise energy matrix: [B, T_text, T_mel]
+        energy = torch.bmm(t_proj, m_proj.transpose(1, 2)) / self.scale
 
-    # Sum along mel frames to get exact duration per character
-    durations = path.sum(dim=-1)  # [B, T_text]
-    return durations, path
+        # 3. Dynamic sequence masking
+        t_mask = torch.arange(T_text, device=device).unsqueeze(0) < text_lens.unsqueeze(1)  # [B, T_text]
+        m_mask = torch.arange(T_mel, device=device).unsqueeze(0) < mel_lens.unsqueeze(1)    # [B, T_mel]
+        joint_mask = t_mask.unsqueeze(2) & m_mask.unsqueeze(1)                             # [B, T_text, T_mel]
+
+        energy_masked = energy.masked_fill(~joint_mask, -1e9)
+
+        # 4. Soft attention distribution
+        attn_soft = F.softmax(energy_masked, dim=1)  # Softmax over text tokens
+
+        # 5. Binarization Loss: pushes soft attention weights towards 0 or 1
+        bin_loss = -torch.mean(torch.abs(attn_soft - 0.5))
+
+        # 6. Extract Viterbi hard monotonic path
+        attn_log = F.log_softmax(energy_masked, dim=1)
+        sim_np = attn_log.detach().cpu().numpy()
+        mask_np = joint_mask.cpu().numpy()
+        hard_path_np = maximum_path_numpy(sim_np, mask_np)
+        hard_path = torch.from_numpy(hard_path_np).to(device)  # [B, T_text, T_mel]
+
+        # Alignment-derived durations per character: [B, T_text]
+        durations = hard_path.sum(dim=-1)
+
+        # 7. Forward-Sum Loss (CTC formulation on monotonic state lattice)
+        targets = torch.stack([
+            torch.cat([
+                torch.arange(1, text_lens[b] + 1, device=device),
+                torch.zeros(T_text - text_lens[b], dtype=torch.long, device=device)
+            ])
+            for b in range(B)
+        ])
+
+        blank_energy = torch.zeros(B, 1, T_mel, device=device)
+        full_energy = torch.cat([blank_energy, energy_masked], dim=1)         # [B, T_text+1, T_mel]
+        log_probs = F.log_softmax(full_energy.permute(2, 0, 1), dim=-1)       # [T_mel, B, T_text+1]
+
+        forward_sum_loss = F.ctc_loss(log_probs, targets, mel_lens, text_lens, blank=0, zero_infinity=True)
+
+        return durations, hard_path, forward_sum_loss, bin_loss

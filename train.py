@@ -1,17 +1,13 @@
 """
-TamilTTS Multi-GPU / High-VRAM Training Pipeline — v8 (SOTA Kokoro / AI4Bharat Architecture)
-=============================================================================================
+TamilTTS Multi-GPU Training Pipeline — SOTA FastPitch + RAD-TTS Architecture
+============================================================================
 Features:
-- Auto-Hardware Optimization: Automatically configures ultra-fast single-GPU settings
-  for high-VRAM cards (RTX PRO 6000 Blackwell 96GB, A100/H100, L40S) or multi-GPU DDP for L4x4.
-- Decoupled Acoustic Model (Transformer + MAS + Style Diffusion + 5-layer PostNet).
-- Pre-trained Frozen Universal HiFi-GAN Vocoder (zero buzzing, zero compute waste).
-- Monotonic Alignment Search (MAS) for dynamic phoneme-to-mel frame duration learning.
-- Dual Mel-Spectrogram Loss (Pre-PostNet coarse + Post-PostNet refined).
-- Masked Log-Duration Loss (Kokoro-82M / FastPitch standard).
-- Multi-layer WavLM Speech Language Model Perceptual Loss (layers 3, 6, 9, 12).
-- Kokoro-82M Gradient Explosion Guard (skips outlier corrupted batches).
-- Robust Master Addr / Port configuration to prevent DDP rendezvous errors.
+- Dynamic Batch Collation (no rigid sequence padding).
+- Learned RAD-TTS Alignment Network (Forward-Sum Loss + Binarization Loss + Viterbi Durations).
+- Masked Dual Mel Loss (Coarse + 5-Layer PostNet Refined Mel at 22.05 kHz).
+- Frozen Universal HiFi-GAN Vocoder (13.93M parameters).
+- Staged Training (Stage 1: Mel + Alignment + Duration; Stage 2: Prosody + SLM).
+- Hardware Auto-Optimization (RTX PRO 6000 Blackwell 96GB or 4x L4 DDP).
 """
 import os
 import gc
@@ -30,15 +26,11 @@ from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
 from config import Config
 from models import TamilTTS
 from models.vocoder import load_pretrained_vocoder
-from models.alignment import monotonic_alignment_search
-from losses import DualMelLoss, LogDurationLoss, CTCAlignmentLoss, SLMLoss, SRFDLoss
+from losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss
 from data import build_tamil_datasets
+from data.dataset import tamil_tts_collate_fn
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
 
-
-# ---------------------------------------------------------------------------
-# Helpers & Hardware Auto-Detection
-# ---------------------------------------------------------------------------
 
 def is_main_process(rank):
     return rank == 0 or rank == -1
@@ -50,11 +42,6 @@ def log(msg, rank=0):
 
 
 def auto_configure_hardware(cfg):
-    """
-    Detects GPU hardware and optimizes training parameters.
-    - If RTX PRO 6000 Blackwell (96GB) or A100/H100: Activates Ultra-Fast Single GPU mode (Batch 64, GradAccum 1).
-    - If 4x L4: Configures DDP (Batch 8, GradAccum 4).
-    """
     if not torch.cuda.is_available():
         return "cpu", 1
 
@@ -62,7 +49,6 @@ def auto_configure_hardware(cfg):
     gpu_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
 
-    # Enable TF32 tensor core acceleration for Blackwell, Ada Lovelace, Hopper, Ampere
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -73,91 +59,73 @@ def auto_configure_hardware(cfg):
     print(f"  Detected GPUs  : {num_gpus}x {gpu_name}")
     print(f"  Primary VRAM   : {total_vram_gb:.1f} GB")
 
-    # High-VRAM Single GPU (RTX PRO 6000 Blackwell 96GB, A100 80GB, H100 80GB, L40S 48GB, RTX 6000 Ada 48GB)
     if num_gpus == 1 and total_vram_gb >= 40.0:
         batch_sz = 64 if total_vram_gb >= 70.0 else 32
         print(f"  🚀 ULTRA-FAST HIGH-VRAM MODE ({gpu_name})")
         print(f"  -> Batch Size: {batch_sz} | Grad Accum: 1 (Instant single-step updates, 0 DDP overhead)")
         cfg.per_gpu_batch = batch_sz
         cfg.grad_accum_steps = 1
-        cfg.num_workers = min(os.cpu_count() or 4, 8)
-        print("=" * 60)
         return "single_high_vram", 1
 
-    # Multi-GPU Cluster (e.g. 4x L4, 2x T4)
     elif num_gpus > 1:
         print(f"  🔥 MULTI-GPU DDP MODE ({num_gpus}x {gpu_name})")
-        cfg.per_gpu_batch = 8
-        cfg.grad_accum_steps = 4
-        cfg.num_workers = 4
-        print("=" * 60)
+        print(f"  -> Per-GPU Batch: {cfg.per_gpu_batch} | Grad Accum: {cfg.grad_accum_steps}")
         return "ddp", num_gpus
 
-    # Standard Single GPU (e.g. 1x T4, 1x L4)
     else:
         print(f"  ⚡ STANDARD SINGLE GPU MODE ({gpu_name})")
-        cfg.per_gpu_batch = 8
+        cfg.per_gpu_batch = 16 if total_vram_gb >= 15.0 else 8
         cfg.grad_accum_steps = 4
-        cfg.num_workers = 4
-        print("=" * 60)
-        return "single_standard", 1
+        return "single_gpu", 1
 
-
-# ---------------------------------------------------------------------------
-# Evaluation Function
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate(model, val_loader, srfd_loss_fn, device, local_rank=0):
-    was_training = model.training
-    model.eval()
+    eval_model = model.module if hasattr(model, "module") else model
+    eval_model.eval()
+    dual_mel_fn = DualMelLoss(coarse_weight=0.5, refined_weight=1.0)
 
-    raw_model = model.module if hasattr(model, "module") else model
     total_mel_loss = 0.0
     total_srfd = 0.0
-    n = 0
+    count = 0
 
-    pbar = tqdm(val_loader, desc="Validating", leave=False, disable=not is_main_process(local_rank))
-    for text_tokens, ref_mel, real_audio in pbar:
+    pbar = tqdm(val_loader, desc="Validating", unit="batch", ncols=120, disable=not is_main_process(local_rank))
+    for batch in pbar:
+        if batch is None:
+            continue
+        text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch
         text_tokens = text_tokens.to(device)
+        text_lens   = text_lens.to(device)
         ref_mel     = ref_mel.to(device)
+        mel_lens    = mel_lens.to(device)
         real_audio  = real_audio.to(device)
-        text_mask   = (text_tokens == 0)
 
-        gen_audio, mel_refined, mel_coarse, dur_pred, _ = raw_model(
-            text_tokens, ref_mel,
-            text_mask=text_mask,
-        )
+        with torch.no_grad():
+            gen_audio, mel_refined, mel_coarse, _, _, _, _, _ = eval_model(
+                text_tokens, text_lens, ref_mel=ref_mel, mel_lens=mel_lens
+            )
+            mel_target = ref_mel.transpose(1, 2)
+            loss_mel, _, _ = dual_mel_fn(mel_refined, mel_coarse, mel_target, mel_lens=mel_lens)
 
-        mel_target = ref_mel.transpose(1, 2)
-        min_t = min(mel_refined.size(1), mel_target.size(1))
-        mel_loss = F.l1_loss(mel_refined[:, :min_t], mel_target[:, :min_t])
-        total_mel_loss += mel_loss.item()
+            min_a = min(gen_audio.size(1), real_audio.size(1))
+            srfd = srfd_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
-        min_a = min(gen_audio.size(1), real_audio.size(1))
-        srfd = srfd_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
+        total_mel_loss += loss_mel.item()
         total_srfd += srfd.item()
+        count += 1
 
-        n += 1
-        pbar.set_postfix(mel=f"{mel_loss.item():.4f}", srfd=f"{srfd.item():.4f}")
+        if is_main_process(local_rank):
+            pbar.set_postfix({"mel": f"{loss_mel.item():.4f}", "srfd": f"{srfd.item():.4f}"})
 
-    if was_training:
-        model.train()
-    return total_mel_loss / max(n, 1), total_srfd / max(n, 1)
+    eval_model.train()
+    return total_mel_loss / max(count, 1), total_srfd / max(count, 1)
 
-
-# ---------------------------------------------------------------------------
-# Training Worker Function
-# ---------------------------------------------------------------------------
 
 def train_worker(local_rank, world_size, cfg):
-    # 1. Setup Process Group
     is_distributed = world_size > 1
     if is_distributed:
-        # Guarantee MASTER_ADDR and MASTER_PORT exist
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
-
         if not dist.is_initialized():
             dist.init_process_group(
                 backend="nccl",
@@ -171,13 +139,12 @@ def train_worker(local_rank, world_size, cfg):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     log("=" * 60, local_rank)
-    log("  TamilTTS Training Pipeline (v8 — SOTA Architecture)", local_rank)
+    log("  TamilTTS Training Pipeline (SOTA FastPitch + RAD-TTS Standard)", local_rank)
     log("=" * 60, local_rank)
 
-    # 2. Model & Pre-trained Frozen Vocoder
+    # 1. Model & Vocoder
     model = TamilTTS(cfg).to(device)
 
-    # Load frozen universal HiFi-GAN weights into vocoder
     if cfg.vocoder_ckpt and os.path.exists(cfg.vocoder_ckpt):
         log(f"  Loading Frozen Vocoder: {cfg.vocoder_ckpt}", local_rank)
         vocoder_loaded = load_pretrained_vocoder(device=device, checkpoint_path=cfg.vocoder_ckpt)
@@ -200,19 +167,14 @@ def train_worker(local_rank, world_size, cfg):
     log(f"  Gradient Accum Steps: {cfg.grad_accum_steps}", local_rank)
     log(f"  Effective Batch Size: {effective_batch}", local_rank)
 
-    # 3. Optimizer & Scheduler
+    # 2. Optimizer & Scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
     scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
 
-    # 4. Loss Functions
+    # 3. Loss Functions
     dual_mel_loss_fn = DualMelLoss(coarse_weight=cfg.weight_mel_coarse, refined_weight=cfg.weight_mel_refined)
     log_dur_loss_fn  = LogDurationLoss()
-    ctc_loss_fn      = CTCAlignmentLoss()
-
-    log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
-    wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir, low_cpu_mem_usage=True).to(device)
-    slm_loss_fn = SLMLoss(wavlm, sample_rate=cfg.sample_rate)
 
     log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
     whisper_model = WhisperModel.from_pretrained(cfg.whisper_dir, low_cpu_mem_usage=True)
@@ -222,7 +184,13 @@ def train_worker(local_rank, world_size, cfg):
     del whisper_model
     gc.collect()
 
-    # 5. Dataset & Loaders
+    slm_loss_fn = None
+    if cfg.weight_slm > 0.0:
+        log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
+        wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir, low_cpu_mem_usage=True).to(device)
+        slm_loss_fn = SLMLoss(wavlm, sample_rate=cfg.sample_rate)
+
+    # 4. Dataset & Dynamic Loaders
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
@@ -235,6 +203,7 @@ def train_worker(local_rank, world_size, cfg):
         batch_size=cfg.per_gpu_batch,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
+        collate_fn=tamil_tts_collate_fn,
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
@@ -246,6 +215,7 @@ def train_worker(local_rank, world_size, cfg):
         batch_size=cfg.per_gpu_batch,
         shuffle=False,
         sampler=val_sampler,
+        collate_fn=tamil_tts_collate_fn,
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
@@ -264,7 +234,7 @@ def train_worker(local_rank, world_size, cfg):
     log(f"  Epochs needed       : {total_epochs}", local_rank)
     log("=" * 60, local_rank)
 
-    # 6. Resume Checkpoint
+    # 5. Checkpoint Resume
     global_step = 0
     best_val_loss = float("inf")
     resume_path = os.path.join(cfg.checkpoint_dir, "latest.pt")
@@ -274,7 +244,7 @@ def train_worker(local_rank, world_size, cfg):
     gc.collect()
     torch.cuda.empty_cache()
 
-    # 7. Training Loop
+    # 6. Training Loop
     try:
         model.train()
         for epoch in range(total_epochs):
@@ -292,48 +262,52 @@ def train_worker(local_rank, world_size, cfg):
 
             optimizer.zero_grad()
 
-            for batch_idx, (text_tokens, ref_mel, real_audio) in pbar:
-                if global_step >= cfg.total_steps:
-                    break
+            for batch_idx, batch in pbar:
+                if batch is None or global_step >= cfg.total_steps:
+                    continue
 
+                text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch
                 text_tokens = text_tokens.to(device)
+                text_lens   = text_lens.to(device)
                 ref_mel     = ref_mel.to(device)
+                mel_lens    = mel_lens.to(device)
                 real_audio  = real_audio.to(device)
-                target_mel_len = ref_mel.size(2)
-
-                text_mask = (text_tokens == 0)
 
                 is_accumulating = is_distributed and ((batch_idx + 1) % cfg.grad_accum_steps != 0)
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
 
                 with sync_context:
-                    # Forward pass with supervised CTC alignment
-                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, ctc_log_probs, target_dur = model(
-                        text_tokens, ref_mel,
-                        target_mel_len=target_mel_len,
-                        text_mask=text_mask,
+                    # Forward pass with RAD-TTS alignment network
+                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, fwd_loss, bin_loss = model(
+                        text_tokens, text_lens,
+                        ref_mel=ref_mel,
+                        mel_lens=mel_lens,
                     )
 
                     # --- Losses ---
-                    # 1. Dual Mel Spectrogram Loss (Coarse + Refined)
+                    # 1. Masked Dual Mel Loss (computed strictly on valid speech frames)
                     mel_target = ref_mel.transpose(1, 2)
-                    loss_mel, loss_ref, loss_crs = dual_mel_loss_fn(mel_refined, mel_coarse, mel_target)
+                    loss_mel, loss_ref, loss_crs = dual_mel_loss_fn(
+                        mel_refined, mel_coarse, mel_target, mel_lens=mel_lens
+                    )
 
-                    # 2. Masked Log-Duration Loss (supervised by CTC-aligned true durations)
-                    loss_dur = log_dur_loss_fn(log_dur_pred, target_dur, mask=text_mask)
+                    # 2. Masked Log-Duration Loss (supervised by alignment-derived durations)
+                    loss_dur = log_dur_loss_fn(log_dur_pred, align_dur, text_lens=text_lens)
 
-                    # 3. Supervised CTC Alignment Loss
-                    loss_align = ctc_loss_fn(ctc_log_probs, text_tokens, text_mask=text_mask)
+                    # 3. RAD-TTS Forward-Sum + Binarization Alignment Loss
+                    loss_align = fwd_loss + cfg.weight_bin * bin_loss
 
-                    # 4. Multi-layer WavLM SLM Loss
-                    min_a = min(gen_audio.size(1), real_audio.size(1))
-                    loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
+                    # 4. Optional Stage 2 SLM Loss
+                    loss_slm = torch.tensor(0.0, device=device)
+                    if slm_loss_fn is not None and cfg.weight_slm > 0.0:
+                        min_a = min(gen_audio.size(1), real_audio.size(1))
+                        loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
                     total_loss = (
                         45.0 * loss_mel
                         + cfg.weight_dur * loss_dur
-                        + cfg.weight_slm * loss_slm
                         + cfg.weight_align * loss_align
+                        + cfg.weight_slm * loss_slm
                     )
 
                     scaled_loss = total_loss / cfg.grad_accum_steps
@@ -343,7 +317,6 @@ def train_worker(local_rank, world_size, cfg):
                 if (batch_idx + 1) % cfg.grad_accum_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
 
-                    # Guard against non-finite (NaN / Inf) gradients
                     if not torch.isfinite(grad_norm):
                         log(f"⚠️ [Step {global_step}] Non-finite gradient detected (NaN/Inf). Skipping batch.", local_rank)
                         optimizer.zero_grad()
@@ -359,13 +332,12 @@ def train_worker(local_rank, world_size, cfg):
                             "step": global_step,
                             "loss": f"{total_loss.item():.2f}",
                             "mel": f"{loss_ref.item():.3f}",
+                            "align": f"{fwd_loss.item():.2f}",
                             "dur": f"{loss_dur.item():.3f}",
-                            "align": f"{loss_align.item():.3f}",
-                            "slm": f"{loss_slm.item():.3f}",
                             "lr": f"{scheduler.get_last_lr()[0]:.1e}",
                         })
 
-                    # Periodic Validation & Checkpointing
+                    # Checkpoint validation
                     if global_step % cfg.save_every == 0 and is_main_process(local_rank):
                         val_mel, val_srfd = evaluate(model, val_loader, srfd_loss_fn, device, local_rank)
                         log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
@@ -408,63 +380,40 @@ def train_worker(local_rank, world_size, cfg):
             dist.destroy_process_group()
 
 
-# ---------------------------------------------------------------------------
-# Main Entry Point
-# ---------------------------------------------------------------------------
-
 def main():
-    # Set default master address & port before anything else to prevent rendezvous errors
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
-
-    parser = argparse.ArgumentParser(description="TamilTTS Training Pipeline (v8 — Kokoro SOTA)")
-    parser.add_argument("--dataset_dir", type=str, nargs="+", default=None,
-                        help="Path(s) to dataset folder(s) containing Parquet files")
-    parser.add_argument("--total_steps", type=int, default=None)
-    parser.add_argument("--per_gpu_batch", type=int, default=None)
-    parser.add_argument("--grad_accum_steps", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--vocoder_ckpt", type=str, default=None,
-                        help="Path to pre-trained frozen HiFi-GAN generator weights")
+    parser = argparse.ArgumentParser(description="TamilTTS Training Pipeline (SOTA FastPitch + RAD-TTS)")
+    parser.add_argument("--dataset_dir", nargs="+", default=None, help="Dataset directories")
+    parser.add_argument("--vocoder_ckpt", type=str, default=None, help="Path to pre-trained frozen HiFi-GAN generator.pt")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size override")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--steps", type=int, default=None, help="Total training steps override")
     args = parser.parse_args()
 
     cfg = Config()
     if args.dataset_dir:
-        cfg.dataset_dir = args.dataset_dir if len(args.dataset_dir) > 1 else args.dataset_dir[0]
-    if args.total_steps:
-        cfg.total_steps = args.total_steps
-    if args.lr:
-        cfg.learning_rate = args.lr
+        cfg.dataset_dir = args.dataset_dir
     if args.vocoder_ckpt:
         cfg.vocoder_ckpt = args.vocoder_ckpt
+    if args.batch_size:
+        cfg.per_gpu_batch = args.batch_size
+    if args.lr:
+        cfg.learning_rate = args.lr
+    if args.steps:
+        cfg.total_steps = args.steps
 
-    # Auto-detect and configure hardware
-    mode, num_gpus = auto_configure_hardware(cfg)
+    train_mode, num_devices = auto_configure_hardware(cfg)
 
-    # CLI overrides if explicitly passed
-    if args.per_gpu_batch:
-        cfg.per_gpu_batch = args.per_gpu_batch
-    if args.grad_accum_steps:
-        cfg.grad_accum_steps = args.grad_accum_steps
-
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-
-    # Detect DDP environment variables
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    if world_size > 1:
-        train_worker(local_rank, world_size, cfg)
-    elif mode == "ddp" and num_gpus > 1:
-        print(f"🔥 Spawning DDP multi-process training across {num_gpus} GPUs...")
+    if train_mode == "ddp":
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        print(f"🔥 Spawning DDP multi-process training across {num_devices} GPUs...")
         torch.multiprocessing.spawn(
             train_worker,
-            args=(num_gpus, cfg),
-            nprocs=num_gpus,
+            args=(num_devices, cfg),
+            nprocs=num_devices,
             join=True
         )
     else:
-        # Single GPU mode (RTX PRO 6000 Blackwell / Single A100 / Single L4)
         train_worker(0, 1, cfg)
 
 

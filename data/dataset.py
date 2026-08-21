@@ -1,8 +1,15 @@
+"""
+High-Throughput Streaming Parquet Dataset for Tamil TTS (FastPitch / RAD-TTS Standard)
+======================================================================================
+- Dynamic Batching & Collation: Sequences are padded only to the max length in that batch.
+- 1-to-1 Audio-Text Integrity: Utterances are filtered by length (0.5s - 10.0s), never truncated independently.
+- Sample Rate: 22,050 Hz (exact match for pre-trained HiFi-GAN V1).
+- Natural Log-Mel: 80 channels, n_fft=1024, hop=256, fmin=0, fmax=8000, clamped [-11.5, 0.0].
+"""
 import os
 import glob
 import re
 import io
-import gc
 import librosa
 import soundfile as sf
 import numpy as np
@@ -10,25 +17,26 @@ import pyarrow.parquet as pq
 import torch
 import torchaudio.functional as AF
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+try:
+    from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+    _tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
+except ImportError:
+    _tamil_normalizer = None
 
-# Initialize IndicNLP Tamil Normalizer once at module level
-_tamil_normalizer = IndicNormalizerFactory().get_normalizer("ta")
-
-# Subscript digit mapping: ₀-₉ -> 0-9
 _SUBSCRIPT_MAP = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
 
 
 def normalize_tamil_text(text):
     """
-    Complete Tamil text normalizer:
-      1. IndicNLP Unicode normalizer for Tamil (canonical glyphs, vowel matras)
-      2. Converts subscript digits (₀-₉) to standard ASCII digits (0-9)
-      3. Cleans duplicate whitespace
+    Tamil text normalizer:
+    1. IndicNLP Unicode normalizer for Tamil.
+    2. Converts subscript digits (₀-₉) to standard ASCII digits (0-9).
+    3. Cleans duplicate whitespace.
     """
     if not isinstance(text, str):
         return ""
-    text = _tamil_normalizer.normalize(text)
+    if _tamil_normalizer is not None:
+        text = _tamil_normalizer.normalize(text)
     text = text.translate(_SUBSCRIPT_MAP)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -62,21 +70,18 @@ def build_tamil_vocab(max_vocab=256):
 class DirectParquetTamilDataset(Dataset):
     """
     Row-Group Level Streaming Parquet Dataset for Tamil TTS.
-    
-    Robustness guarantees:
-    - Decodes embedded audio bytes, float arrays, and file paths with type safety.
-    - Uses PyTorch polyphase resampler for fast 48kHz -> 16kHz conversion.
-    - Zero memory leaks, zero disk caching, 100% stable across multi-GPU DDP.
     """
     def __init__(self, parquet_files, cfg):
         self.parquet_files = sorted(list(set(parquet_files))) if isinstance(parquet_files, (list, tuple)) else [parquet_files]
-        self.sr = cfg.sample_rate
-        self.max_audio_len = cfg.max_audio_len
-        self.max_text_len = cfg.max_text_len
-        self.max_mel_len = cfg.max_mel_len
-        self.n_fft = cfg.n_fft
-        self.hop_length = cfg.hop_length
-        self.mel_channels = cfg.mel_channels
+        self.sr = getattr(cfg, "sample_rate", 22050)
+        self.min_audio_len = getattr(cfg, "min_audio_len", int(0.5 * self.sr))
+        self.max_audio_len = getattr(cfg, "max_audio_len", int(10.0 * self.sr))
+        self.max_text_len = getattr(cfg, "max_text_len", 250)
+        self.n_fft = getattr(cfg, "n_fft", 1024)
+        self.hop_length = getattr(cfg, "hop_length", 256)
+        self.mel_channels = getattr(cfg, "mel_channels", 80)
+        self.f_min = getattr(cfg, "f_min", 0.0)
+        self.f_max = getattr(cfg, "f_max", 8000.0)
 
         self.char2id, self.vocab_size = build_tamil_vocab(max_vocab=getattr(cfg, "vocab_size", 256))
 
@@ -100,7 +105,6 @@ class DirectParquetTamilDataset(Dataset):
         return len(self.index)
 
     def _get_row(self, file_path, rg_idx, row_in_rg):
-        """Reads a row from the cached row group table."""
         cache_key = (file_path, rg_idx)
         if self._cached_key != cache_key or self._cached_table is None:
             self._cached_table = None
@@ -115,17 +119,13 @@ class DirectParquetTamilDataset(Dataset):
         return row_dict
 
     def text_to_ids(self, text):
-        """Normalize Tamil text and convert to token IDs."""
         text = normalize_tamil_text(text)
         ids = [self.char2id.get(ch, 0) for ch in text]
-        ids = [min(i, self.vocab_size - 1) for i in ids]
+        ids = [min(i, self.vocab_size - 1) for i in ids if i > 0]  # strip 0s
         ids = ids[:self.max_text_len]
-        ids += [0] * (self.max_text_len - len(ids))
         return ids
 
     def _decode_audio(self, sample):
-        """Universal, error-proof audio decoder for Rasa and IndicVoices-R."""
-        # 1. Check audio struct dictionary
         audio_val = sample.get("audio")
         if isinstance(audio_val, dict):
             raw_bytes = audio_val.get("bytes")
@@ -143,18 +143,15 @@ class DirectParquetTamilDataset(Dataset):
                 arr, orig_sr = sf.read(path_val)
                 return np.array(arr, dtype=np.float32), orig_sr
 
-        # 2. Check top-level bytes column
         raw_b = sample.get("bytes")
         if isinstance(raw_b, (bytes, bytearray)) and len(raw_b) > 100:
             arr, orig_sr = sf.read(io.BytesIO(raw_b))
             return np.array(arr, dtype=np.float32), orig_sr
 
-        # 3. Direct bytes in audio field
         if isinstance(audio_val, (bytes, bytearray)) and len(audio_val) > 100:
             arr, orig_sr = sf.read(io.BytesIO(audio_val))
             return np.array(arr, dtype=np.float32), orig_sr
 
-        # 4. Fallback file paths
         for key in ["wav_path", "audio_filepath", "path", "filename"]:
             p = sample.get(key)
             if isinstance(p, str) and os.path.exists(p):
@@ -165,8 +162,8 @@ class DirectParquetTamilDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Extracts normalized text, raw audio, and log-mel spectrogram.
-        Pads mel spectrogram with acoustic silence (-11.5).
+        Returns dynamic, unpadded sequence tensors with exact lengths:
+        (token_ids, text_len, mel_tensor, mel_len, audio_tensor, audio_len)
         """
         total = len(self.index)
         for offset in range(total):
@@ -185,76 +182,91 @@ class DirectParquetTamilDataset(Dataset):
                 if not isinstance(text, str) or not text.strip():
                     continue
 
-                token_ids = torch.tensor(self.text_to_ids(text), dtype=torch.long)
+                ids = self.text_to_ids(text)
+                if len(ids) < 2 or len(ids) > self.max_text_len:
+                    continue
+                token_ids = torch.tensor(ids, dtype=torch.long)
+                text_len = len(ids)
 
                 # 2. Extract and Decode Audio
                 audio_array, orig_sr = self._decode_audio(sample)
                 if audio_array is None:
                     continue
 
-                # Ensure float32 numpy array
                 if audio_array.dtype != np.float32:
                     audio_array = audio_array.astype(np.float32)
 
-                # Convert stereo to mono
                 if audio_array.ndim > 1:
                     audio_array = np.mean(audio_array, axis=1)
 
-                # Resample to 16kHz
+                # Resample to 22,050 Hz (exact HiFi-GAN V1 rate)
                 if orig_sr != self.sr:
                     audio_t = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0)
                     audio_resampled = AF.resample(audio_t, orig_sr, self.sr).squeeze(0).numpy()
                     audio_array = audio_resampled
 
-                # Skip clips shorter than 0.2 seconds
-                if len(audio_array) < int(0.2 * self.sr):
+                # Filter complete utterances by length (no artificial chopping of text)
+                audio_len = len(audio_array)
+                if audio_len < self.min_audio_len or audio_len > self.max_audio_len:
                     continue
 
-                # Compute standard Natural Log-Mel Spectrogram (HiFi-GAN / Kokoro standard)
+                # 3. Compute Natural Log-Mel Spectrogram (22.05 kHz)
                 mel = librosa.feature.melspectrogram(
                     y=audio_array, sr=self.sr, n_fft=self.n_fft,
                     hop_length=self.hop_length, n_mels=self.mel_channels,
-                    fmin=0.0, fmax=8000.0,
+                    fmin=self.f_min, fmax=self.f_max,
                 )
-                mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))  # Standard range: [-11.51, ~2.0]
-                mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)   # Kokoro standard clamp for HiFi-GAN
+                mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))  # [-11.5, ~2.0]
+                mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)      # Clamped to HiFi-GAN dynamic range
 
-                # Pad or truncate Mel Spectrogram with true acoustic silence (ln(1e-5) = -11.51)
-                silence_val = -11.5
-                if mel_log.shape[1] > self.max_mel_len:
-                    mel_log = mel_log[:, :self.max_mel_len]
-                else:
-                    mel_log = np.pad(
-                        mel_log,
-                        ((0, 0), (0, self.max_mel_len - mel_log.shape[1])),
-                        mode="constant",
-                        constant_values=silence_val,
-                    )
+                mel_len = mel_log.shape[1]
+                if mel_len < 4 or mel_len < text_len:
+                    # Mel frames must be at least as long as characters for alignment
+                    continue
 
-                # Pad or truncate raw audio with SILENCE (0.0)
-                if len(audio_array) > self.max_audio_len:
-                    audio_array = audio_array[:self.max_audio_len]
-                else:
-                    audio_array = np.pad(
-                        audio_array,
-                        (0, self.max_audio_len - len(audio_array)),
-                        mode="constant",
-                        constant_values=0.0,
-                    )
+                mel_tensor = torch.tensor(mel_log, dtype=torch.float32)        # [80, mel_len]
+                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)  # [audio_len]
 
-                mel_tensor = torch.tensor(mel_log, dtype=torch.float32)        # [80, max_mel_len]
-                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)  # [max_audio_len]
-
-                return token_ids, mel_tensor, audio_tensor
+                return token_ids, text_len, mel_tensor, mel_len, audio_tensor, audio_len
 
             except Exception:
                 continue
 
-        # Ultimate fallback: return a neutral silence sample rather than raising RuntimeError
-        token_ids = torch.zeros(self.max_text_len, dtype=torch.long)
-        mel_tensor = torch.full((self.mel_channels, self.max_mel_len), -11.5, dtype=torch.float32)
-        audio_tensor = torch.zeros(self.max_audio_len, dtype=torch.float32)
-        return token_ids, mel_tensor, audio_tensor
+        # Neutral fallback
+        dummy_ids = torch.tensor([1, 2], dtype=torch.long)
+        dummy_mel = torch.full((self.mel_channels, 16), -11.5, dtype=torch.float32)
+        dummy_audio = torch.zeros(16 * self.hop_length, dtype=torch.float32)
+        return dummy_ids, 2, dummy_mel, 16, dummy_audio, 16 * self.hop_length
+
+
+def tamil_tts_collate_fn(batch):
+    """
+    Dynamic Batch Collation:
+    Pads sequences only to the maximum length present in that specific batch.
+    """
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+
+    B = len(batch)
+    text_lens = torch.tensor([b[1] for b in batch], dtype=torch.long)
+    mel_lens = torch.tensor([b[3] for b in batch], dtype=torch.long)
+    audio_lens = torch.tensor([b[5] for b in batch], dtype=torch.long)
+
+    max_text_len = int(text_lens.max().item())
+    max_mel_len = int(mel_lens.max().item())
+    max_audio_len = int(audio_lens.max().item())
+
+    padded_tokens = torch.zeros(B, max_text_len, dtype=torch.long)
+    padded_mel = torch.full((B, 80, max_mel_len), -11.5, dtype=torch.float32)
+    padded_audio = torch.zeros(B, max_audio_len, dtype=torch.float32)
+
+    for i, (toks, t_len, mel, m_len, aud, a_len) in enumerate(batch):
+        padded_tokens[i, :t_len] = toks[:t_len]
+        padded_mel[i, :, :m_len] = mel[:, :m_len]
+        padded_audio[i, :a_len] = aud[:a_len]
+
+    return padded_tokens, text_lens, padded_mel, mel_lens, padded_audio, audio_lens
 
 
 # Aliases for backward compatibility
@@ -263,7 +275,6 @@ ShrutilipiDataset = DirectParquetTamilDataset
 
 
 def resolve_dataset_path(path):
-    """Auto-resolve Kaggle dataset folder path variations."""
     if not isinstance(path, str):
         return path
     search_paths = [
@@ -279,13 +290,9 @@ def resolve_dataset_path(path):
 
 
 def load_single_parquet_dataset_splits(data_path, cfg):
-    """
-    Scans parquet files with deduplication and returns train/val DirectParquetTamilDataset objects.
-    """
     resolved_path = resolve_dataset_path(data_path)
     print(f"  Scanning parquet files from: {resolved_path}")
 
-    # Use set to strictly prevent duplicate entries
     train_files = sorted(list(set(
         glob.glob(os.path.join(resolved_path, "**", "*train*.parquet"), recursive=True)
         or glob.glob(os.path.join(resolved_path, "*train*.parquet"))
@@ -303,7 +310,6 @@ def load_single_parquet_dataset_splits(data_path, cfg):
             print(f"    ✓ Found {len(test_files)} test/val parquet file(s)")
             val_ds = DirectParquetTamilDataset(test_files, cfg)
         else:
-            total_n = len(train_ds)
             train_files_list = train_ds.parquet_files
             train_ds = DirectParquetTamilDataset(train_files_list, cfg)
             val_ds = DirectParquetTamilDataset(train_files_list[-1:], cfg)
@@ -327,19 +333,12 @@ def load_single_parquet_dataset_splits(data_path, cfg):
     raise FileNotFoundError(f"No parquet files found in: {resolved_path}")
 
 
-# Backward compatibility alias
 load_single_dataset_splits = load_single_parquet_dataset_splits
 
 
 def build_tamil_datasets(dataset_dirs, cfg, num_proc=None):
-    """
-    Builds combined Tamil TTS datasets directly from Parquet files without writing any cache to disk.
-    """
     if isinstance(dataset_dirs, str):
-        if "," in dataset_dirs:
-            dirs = [d.strip() for d in dataset_dirs.split(",") if d.strip()]
-        else:
-            dirs = [dataset_dirs]
+        dirs = [d.strip() for d in dataset_dirs.split(",") if d.strip()]
     elif isinstance(dataset_dirs, (list, tuple)):
         dirs = list(dataset_dirs)
     else:
@@ -380,12 +379,12 @@ def build_tamil_datasets(dataset_dirs, cfg, num_proc=None):
 
 
 def build_dataloaders(cfg):
-    """Builds PyTorch DataLoaders with high-speed multi-core loading."""
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.per_gpu_batch,
         shuffle=True,
+        collate_fn=tamil_tts_collate_fn,
         num_workers=cfg.num_workers,
         pin_memory=True,
         persistent_workers=(cfg.num_workers > 0),
@@ -396,6 +395,7 @@ def build_dataloaders(cfg):
         val_ds,
         batch_size=cfg.per_gpu_batch,
         shuffle=False,
+        collate_fn=tamil_tts_collate_fn,
         num_workers=cfg.num_workers,
         pin_memory=True,
         persistent_workers=(cfg.num_workers > 0),
