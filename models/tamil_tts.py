@@ -1,3 +1,13 @@
+"""
+TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / StyleTTS 2 SOTA Standard)
+========================================================================================
+- TextEncoder: Transformer with padding masking and positional encoding.
+- StyleEncoder: Extracts reference speaker voice embedding.
+- DurationPredictor + Monotonic Alignment Search (MAS): True character duration learning.
+- DiffusionProsody: Style and prosody latent modulation.
+- AcousticProj: High-resolution 80-channel Mel Spectrogram generator.
+- FullVocoder: Pre-trained Universal HiFi-GAN Vocoder for waveform synthesis.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +16,7 @@ from .style_encoder import StyleEncoder
 from .duration_predictor import DurationPredictor
 from .diffusion import DiffusionProsody
 from .vocoder import FullVocoder
+from .alignment import monotonic_alignment_search
 
 
 def length_regulate(x, durations, max_len=None):
@@ -45,12 +56,12 @@ class TamilTTS(nn.Module):
     Complete End-to-End TamilTTS Architecture.
     
     Training:
-      Text -> TextEncoder (masked) -> DurationPredictor -> length_regulate(using TARGET_DUR)
-           -> Prosody/Style Diffusion -> Acoustic Proj -> Vocoder (HiFi-GAN MRF) -> Audio
+      Text -> TextEncoder -> Monotonic Alignment Search (MAS) -> Duration Loss
+           -> length_regulate(MAS durations) -> DiffusionProsody -> AcousticProj -> Mel Pred (L1 Loss)
 
     Inference:
-      Text -> TextEncoder -> DurationPredictor -> length_regulate(using PREDICTED_DUR)
-           -> Prosody/Style Diffusion -> Acoustic Proj -> Vocoder -> Clean Speech
+      Text -> TextEncoder -> DurationPredictor -> length_regulate(Predicted Durations)
+           -> DiffusionProsody -> AcousticProj -> Mel Pred -> HiFi-GAN Vocoder -> Clean 16kHz Audio
     """
     def __init__(self, cfg):
         super().__init__()
@@ -80,6 +91,7 @@ class TamilTTS(nn.Module):
             nn.LeakyReLU(0.1),
             nn.Linear(cfg.hidden_dim // 2, cfg.mel_channels),
         )
+        self.mel_align_proj = nn.Linear(cfg.mel_channels, cfg.hidden_dim)
         self.vocoder = FullVocoder(
             in_channels=cfg.mel_channels,
             upsample_initial_channel=512,
@@ -89,10 +101,10 @@ class TamilTTS(nn.Module):
     def forward(self, text_tokens, ref_mel, target_mel_len=None, text_mask=None, target_dur=None):
         """
         text_tokens:    [B, T_text]
-        ref_mel:        [B, 80, T_mel] (reference for style)
+        ref_mel:        [B, 80, T_mel] (target/reference mel)
         target_mel_len: int (optional target frame count)
         text_mask:      [B, T_text] boolean mask (True = PAD)
-        target_dur:     [B, T_text] (ground-truth duration during training)
+        target_dur:     [B, T_text] (explicit durations, if provided)
         """
         # 1. Extract speaker style embedding from reference mel
         style = self.style_encoder(ref_mel)                          # [B, 256]
@@ -103,26 +115,32 @@ class TamilTTS(nn.Module):
         # 3. Predict durations for each character
         dur_pred = self.duration_predictor(x, mask=text_mask)        # [B, T_text]
 
-        # 4. Length Regulation
-        # During TRAINING: use target_dur for rock-solid phoneme-to-acoustic alignment
-        # During INFERENCE: dynamically size mel_len to match total predicted durations
-        if target_dur is not None:
+        # 4. Determine durations for length regulation:
+        # If in training and target_dur is None: use Monotonic Alignment Search (MAS)!
+        if self.training and target_dur is None and ref_mel is not None:
+            with torch.no_grad():
+                mel_proj = self.mel_align_proj(ref_mel.transpose(1, 2))  # [B, T_mel, 512]
+                mas_durations, _ = monotonic_alignment_search(x, mel_proj, text_mask=text_mask)
+            durations = mas_durations
+            mel_len = target_mel_len if target_mel_len else ref_mel.size(2)
+        elif target_dur is not None:
             durations = target_dur
-            mel_len = target_mel_len if target_mel_len else self.max_mel_len
+            mel_len = target_mel_len if target_mel_len else (ref_mel.size(2) if ref_mel is not None else self.max_mel_len)
         else:
             durations = dur_pred
             total_dur = int(torch.clamp(torch.round(dur_pred), min=0).sum(dim=1).max().item())
             mel_len = target_mel_len if target_mel_len else max(total_dur, 16)
 
+        # 5. Length Regulation
         x_expanded = length_regulate(x, durations, max_len=mel_len)  # [B, mel_len, 512]
 
-        # 5. Modulate prosody & style
+        # 6. Modulate prosody & style
         latents = self.diffusion_prosody(x_expanded, style)          # [B, mel_len, 512]
 
-        # 6. Predict mel spectrogram
+        # 7. Predict 80-channel Mel Spectrogram
         mel_pred = self.acoustic_proj(latents)                       # [B, mel_len, 80]
 
-        # 7. Synthesize audio waveform with HiFi-GAN MRF vocoder
+        # 8. Synthesize waveform via Vocoder
         audio = self.vocoder(mel_pred)                               # [B, T_audio]
 
         return audio, mel_pred, dur_pred

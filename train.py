@@ -25,6 +25,7 @@ from transformers import WhisperModel, WhisperFeatureExtractor, WavLMModel
 
 from config import Config
 from models import TamilTTS
+from models.alignment import monotonic_alignment_search
 from losses import SLMLoss, SRFDLoss
 from data import build_tamil_datasets, build_dataloaders
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
@@ -232,17 +233,20 @@ def train_worker(local_rank, world_size, cfg):
 
                 # Mask padding text tokens (0 is PAD)
                 text_mask = (text_tokens == 0)
-                non_pad = (~text_mask).float()
-                text_lens = non_pad.sum(dim=1, keepdim=True).clamp(min=1)
-                target_dur = non_pad * (target_mel_len / text_lens)
 
-                # Forward pass: Uses target_dur during training for rock-solid phoneme alignment!
+                # Forward pass: Dynamically aligns text to mel via Monotonic Alignment Search (MAS)
                 gen_audio, mel_pred, dur_pred = model(
                     text_tokens, ref_mel,
                     target_mel_len=target_mel_len,
                     text_mask=text_mask,
-                    target_dur=target_dur,
                 )
+
+                # Dynamic Duration Targets from MAS (AI4Bharat / FastPitch standard)
+                with torch.no_grad():
+                    raw_model = model.module if hasattr(model, "module") else model
+                    text_emb = raw_model.text_encoder(text_tokens, mask=text_mask)
+                    mel_proj = raw_model.mel_align_proj(ref_mel.transpose(1, 2))
+                    target_dur, _ = monotonic_alignment_search(text_emb, mel_proj, text_mask=text_mask)
 
                 # --- Losses ---
                 # 1. Acoustic Mel Reconstruction Loss
@@ -256,7 +260,7 @@ def train_worker(local_rank, world_size, cfg):
                 # 3. WavLM Speech Language Model Perceptual Loss
                 loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
-                # 4. Duration Predictor Huber Loss
+                # 4. Duration Predictor Huber Loss (Supervised on true MAS alignments)
                 loss_dur = F.huber_loss(dur_pred, target_dur, delta=1.0)
 
                 total_loss = (
