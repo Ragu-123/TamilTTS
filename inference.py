@@ -197,9 +197,10 @@ def main():
     else:
         print("  Voice Ref  : Neutral Acoustic Distribution")
 
-    # 4. Load Vocoder
+    # 4. Load Vocoder (Strict 100% Match)
     vocoder_path = args.vocoder_ckpt or cfg.vocoder_ckpt
     external_vocoder = load_pretrained_vocoder(device=device, checkpoint_path=vocoder_path)
+    model.vocoder.load_state_dict(external_vocoder.state_dict(), strict=False)
 
     # 5. Synthesize
     print("\n  Generating speech audio...")
