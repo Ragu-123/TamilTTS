@@ -237,8 +237,8 @@ def train_worker(local_rank, world_size, cfg):
     # 5. Checkpoint Resume
     global_step = 0
     best_val_loss = float("inf")
-    resume_path = os.path.join(cfg.checkpoint_dir, "latest.pt")
-    if os.path.exists(resume_path):
+    resume_path = getattr(cfg, "resume_path", None) or os.path.join(cfg.checkpoint_dir, "latest.pt")
+    if resume_path and os.path.exists(resume_path):
         global_step = load_checkpoint(resume_path, model, optimizer, scheduler)
 
     gc.collect()
@@ -386,12 +386,15 @@ def main():
     parser = argparse.ArgumentParser(description="TamilTTS Training Pipeline (SOTA FastPitch + RAD-TTS)")
     parser.add_argument("--dataset_dir", nargs="+", default=None, help="Dataset directories")
     parser.add_argument("--vocoder_ckpt", type=str, default=None, help="Path to pre-trained frozen HiFi-GAN generator.pt")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume training from")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size override")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
     parser.add_argument("--steps", type=int, default=None, help="Total training steps override")
     args = parser.parse_args()
 
     cfg = Config()
+    if args.resume:
+        cfg.resume_path = args.resume
     if args.dataset_dir:
         cfg.dataset_dir = args.dataset_dir
     if args.vocoder_ckpt:
