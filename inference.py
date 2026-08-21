@@ -127,7 +127,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     total_frames = max(total_frames, 32)
 
     # Forward through model using regulated durations
-    audio, mel_refined, mel_coarse, _, _ = eval_model(
+    audio, mel_refined, mel_coarse, _, _, _, _ = eval_model(
         tokens, ref_mel,
         target_mel_len=total_frames,
         text_mask=text_mask,

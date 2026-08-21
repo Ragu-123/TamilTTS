@@ -1,9 +1,10 @@
 """
-Loss Functions for TamilTTS (StyleTTS 2 / Kokoro-82M / FastPitch SOTA Standard)
-==============================================================================
+Loss Functions for TamilTTS (StyleTTS 2 / Kokoro / FastPitch SOTA Standard)
+=============================================================================
 - DualMelLoss: Coarse Mel Loss (Pre-PostNet) + Refined Mel Loss (Post-PostNet).
 - LogDurationLoss: Masked Log-scale Duration Loss.
-- SLMLoss: StyleTTS 2 Multi-layer WavLM Perceptual Feature-matching Loss.
+- CTCAlignmentLoss: Supervised CTC Loss for Grounded Text-to-Mel Alignment.
+- SLMLoss: Multi-layer WavLM Perceptual Feature-matching Loss (resampled 22.05k -> 16k).
 - SRFDLoss: IndicWhisper Speech Representation Fréchet Distance (Validation).
 """
 import torch
@@ -14,7 +15,7 @@ import torchaudio.transforms as T
 
 class DualMelLoss(nn.Module):
     """
-    Dual Mel-Spectrogram Loss (Tacotron 2 / Kokoro-82M standard).
+    Dual Mel-Spectrogram Loss (Tacotron 2 / Kokoro standard).
     Supervises both the coarse acoustic projection and the 5-layer PostNet refinement.
     """
     def __init__(self, coarse_weight=0.5, refined_weight=1.0):
@@ -37,8 +38,8 @@ class DualMelLoss(nn.Module):
 
 class LogDurationLoss(nn.Module):
     """
-    Masked Log-Scale Duration Loss (Kokoro-82M / FastPitch standard).
-    Penalizes relative errors proportionally across consonants and vowels.
+    Masked Log-Scale Duration Loss.
+    Penalizes relative syllable timing errors proportionally.
     """
     def __init__(self):
         super().__init__()
@@ -46,7 +47,7 @@ class LogDurationLoss(nn.Module):
     def forward(self, log_dur_pred, target_dur, mask=None):
         """
         log_dur_pred: [B, T_text] (predicted log-durations)
-        target_dur:   [B, T_text] (ground-truth MAS frame counts)
+        target_dur:   [B, T_text] (ground-truth alignment frame counts)
         mask:         [B, T_text] (True for PAD)
         """
         target_log_dur = torch.log(target_dur.float().clamp(min=1e-5))
@@ -60,15 +61,45 @@ class LogDurationLoss(nn.Module):
         return loss
 
 
+class CTCAlignmentLoss(nn.Module):
+    """
+    Supervised CTC Alignment Loss.
+    Guarantees the alignment head learns to place Tamil phonemes onto exact acoustic frames.
+    """
+    def __init__(self, blank=0):
+        super().__init__()
+        self.blank = blank
+
+    def forward(self, log_probs, text_tokens, text_mask=None):
+        """
+        log_probs:   [T_mel, B, vocab_size]
+        text_tokens: [B, T_text]
+        text_mask:   [B, T_text] (True for PAD)
+        """
+        T_mel, B, _ = log_probs.shape
+        device = text_tokens.device
+
+        if text_mask is not None:
+            text_lens = (~text_mask).long().sum(dim=1)
+        else:
+            text_lens = torch.full((B,), text_tokens.size(1), dtype=torch.long, device=device)
+
+        mel_lens = torch.full((B,), T_mel, dtype=torch.long, device=device)
+
+        # PyTorch Built-in CUDA CTC Loss
+        loss = F.ctc_loss(
+            log_probs, text_tokens, mel_lens, text_lens,
+            blank=self.blank, zero_infinity=True
+        )
+        return loss
+
+
 class SLMLoss(nn.Module):
     """
-    StyleTTS 2 / Kokoro-82M Speech Language Model (SLM) Multi-Layer Feature Matching Loss.
-    
-    Extracts intermediate representations from WavLM layers [3, 6, 9, 12] to evaluate:
-    - Layers 3 & 6: Phonetic precision, formant sharpness, and consonant articulation.
-    - Layers 9 & 12: Speaker timbre, prosody, and natural human vocal tone.
+    Speech Language Model (SLM) Multi-Layer WavLM Feature Matching Loss.
+    Resamples 22.05 kHz audio to 16.0 kHz for WavLM input.
     """
-    def __init__(self, wavlm_model, sample_rate=16000, target_sr=16000):
+    def __init__(self, wavlm_model, sample_rate=22050, target_sr=16000):
         super().__init__()
         self.wavlm = wavlm_model
         for p in self.wavlm.parameters():
@@ -94,15 +125,13 @@ class SLMLoss(nn.Module):
         real_audio = real_audio[..., :min_len]
         gen_audio = gen_audio[..., :min_len]
 
-        # Extract multi-layer hidden states from WavLM
         with torch.no_grad():
             real_out = self.wavlm(real_audio, output_hidden_states=True)
-            real_states = real_out.hidden_states  # Tuple of 13 layer tensors
+            real_states = real_out.hidden_states
 
         gen_out = self.wavlm(gen_audio, output_hidden_states=True)
         gen_states = gen_out.hidden_states
 
-        # Compare across layers [3, 6, 9, 12] (StyleTTS 2 standard)
         target_layers = [3, 6, 9, 12]
         layer_losses = []
         for l_idx in target_layers:
@@ -120,19 +149,26 @@ class SLMLoss(nn.Module):
 
 
 class SRFDLoss(nn.Module):
-    """IndicWhisper SR-FD metric (validation only, no gradients)."""
-    def __init__(self, whisper_encoder, feature_extractor):
+    """IndicWhisper SR-FD metric (validation only)."""
+    def __init__(self, whisper_encoder, feature_extractor, sample_rate=22050):
         super().__init__()
         self.whisper = whisper_encoder
         self.extractor = feature_extractor
         for p in self.whisper.parameters():
             p.requires_grad = False
         self.whisper.eval()
+        self.resampler = T.Resample(orig_freq=sample_rate, new_freq=16000) if sample_rate != 16000 else None
 
     @torch.no_grad()
     def forward(self, real_audio, gen_audio):
         device = next(self.whisper.parameters()).device
         dtype  = next(self.whisper.parameters()).dtype
+
+        if self.resampler is not None:
+            resamp = self.resampler.to(device)
+            real_audio = resamp(real_audio)
+            gen_audio = resamp(gen_audio)
+
         real_mel = self.extractor(
             real_audio.cpu().numpy(), sampling_rate=16000, return_tensors="pt"
         ).input_features.to(device, dtype=dtype)

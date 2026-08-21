@@ -207,7 +207,7 @@ class DirectParquetTamilDataset(Dataset):
                     audio_array = audio_resampled
 
                 # Skip clips shorter than 0.2 seconds
-                if len(audio_array) < 3200:
+                if len(audio_array) < int(0.2 * self.sr):
                     continue
 
                 # Compute standard Natural Log-Mel Spectrogram (HiFi-GAN / Kokoro standard)

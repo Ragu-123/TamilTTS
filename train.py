@@ -31,7 +31,7 @@ from config import Config
 from models import TamilTTS
 from models.vocoder import load_pretrained_vocoder
 from models.alignment import monotonic_alignment_search
-from losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss
+from losses import DualMelLoss, LogDurationLoss, CTCAlignmentLoss, SLMLoss, SRFDLoss
 from data import build_tamil_datasets
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
 
@@ -207,17 +207,18 @@ def train_worker(local_rank, world_size, cfg):
 
     # 4. Loss Functions
     dual_mel_loss_fn = DualMelLoss(coarse_weight=cfg.weight_mel_coarse, refined_weight=cfg.weight_mel_refined)
-    log_dur_loss_fn = LogDurationLoss()
+    log_dur_loss_fn  = LogDurationLoss()
+    ctc_loss_fn      = CTCAlignmentLoss()
 
     log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
     wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir, low_cpu_mem_usage=True).to(device)
-    slm_loss_fn = SLMLoss(wavlm)
+    slm_loss_fn = SLMLoss(wavlm, sample_rate=cfg.sample_rate)
 
     log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
     whisper_model = WhisperModel.from_pretrained(cfg.whisper_dir, low_cpu_mem_usage=True)
     whisper_enc = whisper_model.encoder.to(device)
     whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
-    srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext)
+    srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext, sample_rate=cfg.sample_rate)
     del whisper_model
     gc.collect()
 
@@ -306,29 +307,25 @@ def train_worker(local_rank, world_size, cfg):
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
 
                 with sync_context:
-                    # Forward pass: MAS dynamic alignment
-                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred = model(
+                    # Forward pass with supervised CTC alignment
+                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, ctc_log_probs, target_dur = model(
                         text_tokens, ref_mel,
                         target_mel_len=target_mel_len,
                         text_mask=text_mask,
                     )
-
-                    # Dynamic Duration Targets from MAS
-                    with torch.no_grad():
-                        raw_model = model.module if hasattr(model, "module") else model
-                        text_emb = raw_model.text_encoder(text_tokens, mask=text_mask)
-                        mel_proj = raw_model.mel_align_proj(ref_mel.transpose(1, 2))
-                        target_dur, _ = monotonic_alignment_search(text_emb, mel_proj, text_mask=text_mask)
 
                     # --- Losses ---
                     # 1. Dual Mel Spectrogram Loss (Coarse + Refined)
                     mel_target = ref_mel.transpose(1, 2)
                     loss_mel, loss_ref, loss_crs = dual_mel_loss_fn(mel_refined, mel_coarse, mel_target)
 
-                    # 2. Masked Log-Duration Loss
+                    # 2. Masked Log-Duration Loss (supervised by CTC-aligned true durations)
                     loss_dur = log_dur_loss_fn(log_dur_pred, target_dur, mask=text_mask)
 
-                    # 3. StyleTTS 2 Multi-layer WavLM SLM Loss
+                    # 3. Supervised CTC Alignment Loss
+                    loss_align = ctc_loss_fn(ctc_log_probs, text_tokens, text_mask=text_mask)
+
+                    # 4. Multi-layer WavLM SLM Loss
                     min_a = min(gen_audio.size(1), real_audio.size(1))
                     loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
@@ -336,6 +333,7 @@ def train_worker(local_rank, world_size, cfg):
                         45.0 * loss_mel
                         + cfg.weight_dur * loss_dur
                         + cfg.weight_slm * loss_slm
+                        + cfg.weight_align * loss_align
                     )
 
                     scaled_loss = total_loss / cfg.grad_accum_steps
@@ -359,9 +357,10 @@ def train_worker(local_rank, world_size, cfg):
                     if is_main_process(local_rank):
                         pbar.set_postfix({
                             "step": global_step,
-                            "loss": f"{total_loss.item():.3f}",
+                            "loss": f"{total_loss.item():.2f}",
                             "mel": f"{loss_ref.item():.3f}",
                             "dur": f"{loss_dur.item():.3f}",
+                            "align": f"{loss_align.item():.3f}",
                             "slm": f"{loss_slm.item():.3f}",
                             "lr": f"{scheduler.get_last_lr()[0]:.1e}",
                         })

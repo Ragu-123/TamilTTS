@@ -1,12 +1,13 @@
 """
-TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / Kokoro-82M SOTA Standard)
-========================================================================================
-- TextEncoder: Transformer with padding masking and positional encoding.
+TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / Kokoro SOTA Standard)
+====================================================================================
+- TextEncoder: Transformer with Sinusoidal Positional Encoding & Pad Masking.
 - StyleEncoder: Extracts reference speaker voice embedding for zero-shot voice cloning.
-- DurationPredictor + Monotonic Alignment Search (MAS): True character duration learning.
-- DiffusionProsody: Style and prosody latent modulation.
-- AcousticProj + PostNet: Dual Mel-Spectrogram generator (coarse + 5-layer refined).
-- FullVocoder: Frozen Universal HiFi-GAN Vocoder for 100% buzz-free waveform synthesis.
+- AlignmentModule: CTC-supervised Conv1D alignment head for mathematically grounded text-to-mel alignment.
+- DurationPredictor: Learns log-durations from CTC alignment targets.
+- DiffusionProsody: FiLM-modulated style and prosody latent adaptation.
+- AcousticProj + PostNet: Dual Mel-Spectrogram generator (coarse + 5-layer refined at 22.05 kHz).
+- FullVocoder: Frozen Universal HiFi-GAN Vocoder (22.05 kHz output).
 """
 import torch
 import torch.nn as nn
@@ -17,7 +18,7 @@ from .duration_predictor import DurationPredictor
 from .diffusion import DiffusionProsody
 from .postnet import PostNet
 from .vocoder import FullVocoder
-from .alignment import monotonic_alignment_search
+from .alignment import AlignmentModule, extract_alignment_durations
 
 
 def length_regulate(x, durations, max_len=None):
@@ -55,21 +56,12 @@ def length_regulate(x, durations, max_len=None):
 class TamilTTS(nn.Module):
     """
     Complete End-to-End TamilTTS Architecture.
-    
-    Training:
-      Text -> TextEncoder -> Monotonic Alignment Search (MAS) -> Duration Loss
-           -> length_regulate(MAS durations) -> DiffusionProsody -> AcousticProj -> mel_coarse
-           -> PostNet -> mel_refined (Dual Mel Loss)
-
-    Inference:
-      Text -> TextEncoder -> DurationPredictor -> length_regulate(Predicted Durations)
-           -> DiffusionProsody -> AcousticProj -> PostNet -> mel_refined
-           -> Pre-trained HiFi-GAN Vocoder -> Clean 22.05kHz Audio
     """
     def __init__(self, cfg):
         super().__init__()
+        self.vocab_size = getattr(cfg, "vocab_size", 256)
         self.text_encoder = TextEncoder(
-            vocab_size=getattr(cfg, "vocab_size", 256),
+            vocab_size=self.vocab_size,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.text_encoder_layers,
             num_heads=cfg.text_encoder_heads,
@@ -78,6 +70,11 @@ class TamilTTS(nn.Module):
             mel_channels=cfg.mel_channels,
             hidden_dim=cfg.hidden_dim,
             style_dim=cfg.style_dim,
+        )
+        self.aligner = AlignmentModule(
+            mel_channels=cfg.mel_channels,
+            hidden_dim=256,
+            vocab_size=self.vocab_size,
         )
         self.duration_predictor = DurationPredictor(
             hidden_dim=cfg.hidden_dim,
@@ -104,12 +101,11 @@ class TamilTTS(nn.Module):
             dropout=0.5,
         )
 
-        # Mel initialization matching typical log-mel distributions (prevents initial collapse)
+        # Mel initialization matching natural log-mel distributions (mean ~ -3.5)
         with torch.no_grad():
             self.acoustic_proj[-1].bias.fill_(-3.5)
             self.acoustic_proj[-1].weight.mul_(0.1)
 
-        self.mel_align_proj = nn.Linear(cfg.mel_channels, cfg.hidden_dim)
         self.vocoder = FullVocoder(
             in_channels=cfg.mel_channels,
             upsample_initial_channel=512,
@@ -119,54 +115,59 @@ class TamilTTS(nn.Module):
     def forward(self, text_tokens, ref_mel, target_mel_len=None, text_mask=None, target_dur=None):
         """
         text_tokens:    [B, T_text]
-        ref_mel:        [B, 80, T_mel] (target/reference mel)
+        ref_mel:        [B, 80, T_mel]
         target_mel_len: int (optional target frame count)
         text_mask:      [B, T_text] boolean mask (True = PAD)
         target_dur:     [B, T_text] (explicit durations, if provided)
         
         Returns:
-            audio:       [B, T_audio] (synthesized waveform via vocoder)
-            mel_refined: [B, mel_len, 80] (final post-PostNet mel spectrogram)
-            mel_coarse:  [B, mel_len, 80] (raw decoder mel prediction)
-            dur_pred:    [B, T_text] (predicted linear duration in frames)
-            log_dur_pred:[B, T_text] (predicted log-durations for loss)
+            audio:        [B, T_audio] (synthesized waveform via vocoder)
+            mel_refined:  [B, mel_len, 80] (final post-PostNet mel spectrogram)
+            mel_coarse:   [B, mel_len, 80] (raw decoder mel prediction)
+            dur_pred:     [B, T_text] (predicted linear duration in frames)
+            log_dur_pred: [B, T_text] (predicted log-durations for loss)
+            ctc_log_probs:[T_mel, B, vocab_size] (for CTC alignment loss)
+            align_dur:    [B, T_text] (ground-truth duration from alignment)
         """
         # 1. Extract speaker style embedding from reference mel
         style = self.style_encoder(ref_mel)                          # [B, 256]
 
-        # 2. Encode text with self-attention and pad masking
+        # 2. Encode text with self-attention, positional encoding, and pad masking
         x = self.text_encoder(text_tokens, mask=text_mask)           # [B, T_text, 512]
 
-        # 3. Predict durations for each character
+        # 3. Supervised CTC Alignment
+        ctc_logits, ctc_log_probs = self.aligner(ref_mel)            # logits: [B, vocab, T_mel], log_probs: [T_mel, B, vocab]
+
+        # 4. Predict durations for each character
         dur_pred, log_dur_pred = self.duration_predictor(x, mask=text_mask)  # [B, T_text]
 
-        # 4. Determine durations for length regulation:
+        # 5. Determine durations for length regulation:
         if self.training and target_dur is None and ref_mel is not None:
-            with torch.no_grad():
-                mel_proj = self.mel_align_proj(ref_mel.transpose(1, 2))  # [B, T_mel, 512]
-                mas_durations, _ = monotonic_alignment_search(x, mel_proj, text_mask=text_mask)
-            durations = mas_durations
+            align_dur, _ = extract_alignment_durations(text_tokens, ctc_logits, text_mask=text_mask)
+            durations = align_dur
             mel_len = target_mel_len if target_mel_len else ref_mel.size(2)
         elif target_dur is not None:
+            align_dur = target_dur
             durations = target_dur
             mel_len = target_mel_len if target_mel_len else (ref_mel.size(2) if ref_mel is not None else self.max_mel_len)
         else:
+            align_dur = dur_pred
             durations = dur_pred
             total_dur = int(torch.clamp(torch.round(dur_pred), min=0).sum(dim=1).max().item())
             mel_len = target_mel_len if target_mel_len else max(total_dur, 16)
 
-        # 5. Length Regulation
+        # 6. Length Regulation
         x_expanded = length_regulate(x, durations, max_len=mel_len)  # [B, mel_len, 512]
 
-        # 6. Modulate prosody & style
+        # 7. Modulate prosody & style
         latents = self.diffusion_prosody(x_expanded, style)          # [B, mel_len, 512]
 
-        # 7. Predict Coarse & Refined 80-channel Mel Spectrogram
+        # 8. Predict Coarse & Refined 80-channel Mel Spectrogram (22.05 kHz)
         mel_coarse = self.acoustic_proj(latents)                     # [B, mel_len, 80]
         mel_residual = self.postnet(mel_coarse)                      # [B, mel_len, 80]
         mel_refined = mel_coarse + mel_residual                      # [B, mel_len, 80]
 
-        # 8. Synthesize waveform via Vocoder
+        # 9. Synthesize waveform via Vocoder
         audio = self.vocoder(mel_refined)                            # [B, T_audio]
 
-        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred
+        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, ctc_log_probs, align_dur
