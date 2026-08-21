@@ -24,7 +24,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from lion_pytorch import Lion
 from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
 
 from config import Config
@@ -202,7 +201,7 @@ def train_worker(local_rank, world_size, cfg):
 
     # 3. Optimizer & Scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = Lion(trainable_params, lr=cfg.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
     scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
 
     # 4. Loss Functions

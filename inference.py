@@ -99,7 +99,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     # 2. Reference mel for style extraction (Natural Log-Mel scale)
     if ref_mel is None:
         # Default: True acoustic silence (ln(1e-5) = -11.51)
-        ref_mel = torch.full((1, 80, 50), float(np.log(1e-5)), device=device)
+        ref_mel = torch.full((1, 80, 50), -11.5, device=device)
     elif ref_mel.dim() == 2:
         ref_mel = ref_mel.unsqueeze(0)
     ref_mel = ref_mel.to(device)
@@ -204,6 +204,7 @@ def main():
             fmin=0.0, fmax=8000.0,
         )
         mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
+        mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)
         ref_mel = torch.tensor(mel_log, dtype=torch.float32, device=device).unsqueeze(0)
         print(f"  Ref Voice  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
 

@@ -165,8 +165,8 @@ class DirectParquetTamilDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Extracts normalized text, raw audio, and normalized mel spectrogram.
-        Pads mel spectrogram with SILENCE (-1.0).
+        Extracts normalized text, raw audio, and log-mel spectrogram.
+        Pads mel spectrogram with acoustic silence (-11.5).
         """
         total = len(self.index)
         for offset in range(total):
@@ -217,9 +217,10 @@ class DirectParquetTamilDataset(Dataset):
                     fmin=0.0, fmax=8000.0,
                 )
                 mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))  # Standard range: [-11.51, ~2.0]
+                mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)   # Kokoro standard clamp for HiFi-GAN
 
                 # Pad or truncate Mel Spectrogram with true acoustic silence (ln(1e-5) = -11.51)
-                silence_val = float(np.log(1e-5))
+                silence_val = -11.5
                 if mel_log.shape[1] > self.max_mel_len:
                     mel_log = mel_log[:, :self.max_mel_len]
                 else:
@@ -251,7 +252,7 @@ class DirectParquetTamilDataset(Dataset):
 
         # Ultimate fallback: return a neutral silence sample rather than raising RuntimeError
         token_ids = torch.zeros(self.max_text_len, dtype=torch.long)
-        mel_tensor = torch.full((self.mel_channels, self.max_mel_len), float(np.log(1e-5)), dtype=torch.float32)
+        mel_tensor = torch.full((self.mel_channels, self.max_mel_len), -11.5, dtype=torch.float32)
         audio_tensor = torch.zeros(self.max_audio_len, dtype=torch.float32)
         return token_ids, mel_tensor, audio_tensor
 

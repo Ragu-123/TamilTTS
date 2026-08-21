@@ -33,18 +33,17 @@ class Config:
     max_text_len  = 200
     max_mel_len   = 188     # max_audio_len / hop_length
 
-    # --- Training (DDP + Gradient Accumulation) ---
+    # --- Training ---
     total_steps      = 100_000
-    per_gpu_batch    = 8        # Per-GPU batch size (fits comfortably in 10-16 GB VRAM)
-    grad_accum_steps = 4        # Accumulate 4 micro-batches
-    # Effective batch = per_gpu_batch(8) * num_gpus(4) * grad_accum(4) = 128
+    per_gpu_batch    = 8        # Per-GPU batch size (auto-overridden by hardware detection)
+    grad_accum_steps = 4        # Accumulate micro-batches (auto-overridden by hardware detection)
     num_workers      = 4
-    learning_rate    = 1e-4
-    warmup_steps     = 2_000
+    learning_rate    = 1e-3     # Kokoro standard: AdamW with 1e-3 peak LR
+    warmup_steps     = 4_000    # Linear warmup over ~4000 steps
     save_every       = 2_000
 
-    # --- Loss Weights (Kokoro / FastPitch Standard) ---
+    # --- Loss Weights (Kokoro-82M Exact Standard) ---
     weight_mel_refined = 1.0     # PostNet refined mel loss
     weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss
-    weight_dur         = 1.0     # Log-scale duration loss (MAS alignment)
+    weight_dur         = 0.02    # Log-scale duration loss (Kokoro uses 0.02)
     weight_slm         = 1.0     # Perceptual WavLM speech language model critic
