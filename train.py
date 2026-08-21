@@ -16,6 +16,7 @@ Features:
 import os
 import gc
 import argparse
+from contextlib import nullcontext
 from tqdm.auto import tqdm
 
 import torch
@@ -189,7 +190,7 @@ def train_worker(local_rank, world_size, cfg):
     log(f"  Trainable Parameters: {train_p / 1e6:.2f}M", local_rank)
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         log(f"  🔥 DDP Active       : {world_size} GPUs (Rank {local_rank} on cuda:{local_rank})", local_rank)
     else:
         log(f"  🚀 GPU Active       : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}", local_rank)
@@ -301,40 +302,44 @@ def train_worker(local_rank, world_size, cfg):
 
                 text_mask = (text_tokens == 0)
 
-                # Forward pass: MAS dynamic alignment
-                gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred = model(
-                    text_tokens, ref_mel,
-                    target_mel_len=target_mel_len,
-                    text_mask=text_mask,
-                )
+                is_accumulating = is_distributed and ((batch_idx + 1) % cfg.grad_accum_steps != 0)
+                sync_context = model.no_sync() if is_accumulating else nullcontext()
 
-                # Dynamic Duration Targets from MAS
-                with torch.no_grad():
-                    raw_model = model.module if hasattr(model, "module") else model
-                    text_emb = raw_model.text_encoder(text_tokens, mask=text_mask)
-                    mel_proj = raw_model.mel_align_proj(ref_mel.transpose(1, 2))
-                    target_dur, _ = monotonic_alignment_search(text_emb, mel_proj, text_mask=text_mask)
+                with sync_context:
+                    # Forward pass: MAS dynamic alignment
+                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred = model(
+                        text_tokens, ref_mel,
+                        target_mel_len=target_mel_len,
+                        text_mask=text_mask,
+                    )
 
-                # --- Losses ---
-                # 1. Dual Mel Spectrogram Loss (Coarse + Refined)
-                mel_target = ref_mel.transpose(1, 2)
-                loss_mel, loss_ref, loss_crs = dual_mel_loss_fn(mel_refined, mel_coarse, mel_target)
+                    # Dynamic Duration Targets from MAS
+                    with torch.no_grad():
+                        raw_model = model.module if hasattr(model, "module") else model
+                        text_emb = raw_model.text_encoder(text_tokens, mask=text_mask)
+                        mel_proj = raw_model.mel_align_proj(ref_mel.transpose(1, 2))
+                        target_dur, _ = monotonic_alignment_search(text_emb, mel_proj, text_mask=text_mask)
 
-                # 2. Masked Log-Duration Loss
-                loss_dur = log_dur_loss_fn(log_dur_pred, target_dur, mask=text_mask)
+                    # --- Losses ---
+                    # 1. Dual Mel Spectrogram Loss (Coarse + Refined)
+                    mel_target = ref_mel.transpose(1, 2)
+                    loss_mel, loss_ref, loss_crs = dual_mel_loss_fn(mel_refined, mel_coarse, mel_target)
 
-                # 3. StyleTTS 2 Multi-layer WavLM SLM Loss
-                min_a = min(gen_audio.size(1), real_audio.size(1))
-                loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
+                    # 2. Masked Log-Duration Loss
+                    loss_dur = log_dur_loss_fn(log_dur_pred, target_dur, mask=text_mask)
 
-                total_loss = (
-                    45.0 * loss_mel
-                    + cfg.weight_dur * loss_dur
-                    + cfg.weight_slm * loss_slm
-                )
+                    # 3. StyleTTS 2 Multi-layer WavLM SLM Loss
+                    min_a = min(gen_audio.size(1), real_audio.size(1))
+                    loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
-                scaled_loss = total_loss / cfg.grad_accum_steps
-                scaled_loss.backward()
+                    total_loss = (
+                        45.0 * loss_mel
+                        + cfg.weight_dur * loss_dur
+                        + cfg.weight_slm * loss_slm
+                    )
+
+                    scaled_loss = total_loss / cfg.grad_accum_steps
+                    scaled_loss.backward()
 
                 # Optimizer Step
                 if (batch_idx + 1) % cfg.grad_accum_steps == 0:
