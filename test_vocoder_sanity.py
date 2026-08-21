@@ -22,15 +22,30 @@ from models.vocoder import load_pretrained_vocoder
 
 
 def compute_mel_22k(audio_path, target_sr=22050, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0):
-    audio, sr = librosa.load(audio_path, sr=target_sr)
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=target_sr, n_fft=n_fft,
-        hop_length=hop_length, n_mels=n_mels,
-        fmin=fmin, fmax=fmax,
+    import torchaudio.transforms as T
+    import torchaudio.functional as AF
+    data, orig_sr = sf.read(audio_path)
+    audio_t = torch.tensor(data, dtype=torch.float32)
+    if audio_t.ndim > 1:
+        audio_t = audio_t.mean(dim=-1)
+    if orig_sr != target_sr:
+        audio_t = AF.resample(audio_t, orig_sr, target_sr)
+
+    mel_transform = T.MelSpectrogram(
+        sample_rate=target_sr,
+        n_fft=n_fft,
+        win_length=n_fft,
+        hop_length=hop_length,
+        f_min=fmin,
+        f_max=fmax,
+        n_mels=n_mels,
+        power=1.0,
+        norm="slaney",
+        mel_scale="slaney",
     )
-    mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
-    mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)
-    return mel_log, audio, sr
+    mel = mel_transform(audio_t)
+    mel_log = torch.log(torch.clamp(mel, min=1e-5)).numpy()
+    return mel_log, audio_t.numpy(), target_sr
 
 
 def main():

@@ -62,16 +62,31 @@ def text_to_ids(text, char2id, max_vocab_size=256):
 
 
 def compute_mel_from_audio(audio_path, target_sr=22050, n_fft=1024, hop_length=256, n_mels=80):
-    """Computes clamped natural log-mel spectrogram matching 22.05kHz HiFi-GAN scale."""
-    audio_ref, sr = librosa.load(audio_path, sr=target_sr)
-    mel = librosa.feature.melspectrogram(
-        y=audio_ref, sr=target_sr, n_fft=n_fft,
-        hop_length=hop_length, n_mels=n_mels,
-        fmin=0.0, fmax=8000.0,
+    """Computes magnitude natural log-mel spectrogram matching 22.05kHz HiFi-GAN scale."""
+    import torchaudio.transforms as T
+    import torchaudio.functional as AF
+    data, orig_sr = sf.read(audio_path)
+    audio_t = torch.tensor(data, dtype=torch.float32)
+    if audio_t.ndim > 1:
+        audio_t = audio_t.mean(dim=-1)
+    if orig_sr != target_sr:
+        audio_t = AF.resample(audio_t, orig_sr, target_sr)
+
+    mel_transform = T.MelSpectrogram(
+        sample_rate=target_sr,
+        n_fft=n_fft,
+        win_length=n_fft,
+        hop_length=hop_length,
+        f_min=0.0,
+        f_max=8000.0,
+        n_mels=n_mels,
+        power=1.0,
+        norm="slaney",
+        mel_scale="slaney",
     )
-    mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
-    mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)
-    return mel_log, len(audio_ref) / sr
+    mel = mel_transform(audio_t)
+    mel_log = torch.log(torch.clamp(mel, min=1e-5)).numpy()
+    return mel_log, len(audio_t) / target_sr
 
 
 @torch.no_grad()

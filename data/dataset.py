@@ -210,24 +210,31 @@ class DirectParquetTamilDataset(Dataset):
                 if audio_len < self.min_audio_len or audio_len > self.max_audio_len:
                     continue
 
-                # 3. Compute Natural Log-Mel Spectrogram (22.05 kHz)
-                mel = librosa.feature.melspectrogram(
-                    y=audio_array, sr=self.sr, n_fft=self.n_fft,
-                    hop_length=self.hop_length, n_mels=self.mel_channels,
-                    fmin=self.f_min, fmax=self.f_max,
-                )
-                mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))  # [-11.5, ~2.0]
-                mel_log = np.clip(mel_log, a_min=-11.5, a_max=0.0)      # Clamped to HiFi-GAN dynamic range
+                # 3. Compute Natural Log-Mel Spectrogram (22.05 kHz Magnitude)
+                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+                if not hasattr(self, "_mel_transform") or self._mel_transform is None:
+                    import torchaudio.transforms as T
+                    self._mel_transform = T.MelSpectrogram(
+                        sample_rate=self.sr,
+                        n_fft=self.n_fft,
+                        win_length=self.n_fft,
+                        hop_length=self.hop_length,
+                        f_min=self.f_min,
+                        f_max=self.f_max,
+                        n_mels=self.mel_channels,
+                        power=1.0,
+                        norm="slaney",
+                        mel_scale="slaney",
+                    )
 
+                mel = self._mel_transform(audio_tensor)
+                mel_log = torch.log(torch.clamp(mel, min=1e-5))
                 mel_len = mel_log.shape[1]
+
                 if mel_len < 4 or mel_len < text_len:
-                    # Mel frames must be at least as long as characters for alignment
                     continue
 
-                mel_tensor = torch.tensor(mel_log, dtype=torch.float32)        # [80, mel_len]
-                audio_tensor = torch.tensor(audio_array, dtype=torch.float32)  # [audio_len]
-
-                return token_ids, text_len, mel_tensor, mel_len, audio_tensor, audio_len
+                return token_ids, text_len, mel_log, mel_len, audio_tensor, audio_len
 
             except Exception:
                 continue
