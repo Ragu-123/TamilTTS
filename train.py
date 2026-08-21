@@ -340,11 +340,10 @@ def train_worker(local_rank, world_size, cfg):
                 # Optimizer Step
                 if (batch_idx + 1) % cfg.grad_accum_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                    grad_val = grad_norm.item() if torch.isfinite(grad_norm) else 0.0
 
-                    # Kokoro Gradient Explosion Guard
-                    if not torch.isfinite(grad_norm) or grad_val > 10.0:
-                        log(f"⚠️ [Step {global_step}] Gradient explosion (norm={grad_val:.2f} > 10.0). Skipping batch to protect weights.", local_rank)
+                    # Guard against non-finite (NaN / Inf) gradients
+                    if not torch.isfinite(grad_norm):
+                        log(f"⚠️ [Step {global_step}] Non-finite gradient detected (NaN/Inf). Skipping batch.", local_rank)
                         optimizer.zero_grad()
                         continue
 
