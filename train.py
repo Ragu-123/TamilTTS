@@ -275,13 +275,13 @@ def train_worker(local_rank, world_size, cfg):
 
                 is_accumulating = is_distributed and ((batch_idx + 1) % cfg.grad_accum_steps != 0)
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
-
                 with sync_context:
-                    # Forward pass with RAD-TTS alignment network
+                    need_audio = (slm_loss_fn is not None and cfg.weight_slm > 0.0)
                     gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, fwd_loss, bin_loss = model(
                         text_tokens, text_lens,
                         ref_mel=ref_mel,
                         mel_lens=mel_lens,
+                        return_audio=need_audio,
                     )
 
                     # --- Losses ---

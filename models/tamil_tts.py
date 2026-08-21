@@ -114,7 +114,7 @@ class TamilTTS(nn.Module):
             upsample_initial_channel=512,
         )
 
-    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None, style_dropout_p=0.5):
+    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None, style_dropout_p=0.5, return_audio=False):
         """
         text_tokens: [B, T_text]
         text_lens:   [B] (actual token lengths)
@@ -123,7 +123,7 @@ class TamilTTS(nn.Module):
         target_dur:  [B, T_text] (explicit durations, if provided)
 
         Returns:
-            audio:            [B, T_audio] (synthesized waveform)
+            audio:            [B, T_audio] or None
             mel_refined:      [B, mel_len, 80] (post-PostNet mel spectrogram)
             mel_coarse:       [B, mel_len, 80] (pre-PostNet mel prediction)
             dur_pred:         [B, T_text] (predicted linear duration)
@@ -188,7 +188,10 @@ class TamilTTS(nn.Module):
         mel_residual = self.postnet(mel_coarse)                      # [B, mel_len, 80]
         mel_refined = mel_coarse + mel_residual                      # [B, mel_len, 80]
 
-        # 8. Synthesize waveform via Vocoder
-        audio = self.vocoder(mel_refined)                            # [B, T_audio]
+        # 8. Synthesize waveform via Vocoder ONLY when required (inference/eval/SLM)
+        if return_audio or not self.training:
+            audio = self.vocoder(mel_refined)                        # [B, T_audio]
+        else:
+            audio = None
 
         return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, forward_sum_loss, bin_loss
