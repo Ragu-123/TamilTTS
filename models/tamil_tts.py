@@ -2,12 +2,12 @@
 TamilTTS Acoustic Model Architecture (FastPitch / RAD-TTS SOTA Standard)
 =========================================================================
 - TextEncoder: Transformer with Sinusoidal Positional Encoding & Pad Masking.
-- StyleEncoder: Extracts reference speaker voice embedding for zero-shot voice cloning.
-- AlignmentNetwork: RAD-TTS / FastPitch attention aligner trained with Forward-Sum & Binarization Loss.
+- StyleEncoder: Extracts reference speaker voice embedding with 50% training style dropout (Anti-Leakage).
+- AlignmentNetwork: Exact RAD-TTS Forward-Sum + True Binarization Loss + Viterbi MAS on unified log_A.
 - DurationPredictor: Dilated Conv1D log-duration predictor trained on alignment-derived durations.
 - DiffusionProsody: FiLM-modulated prosody & style latent modulation.
 - AcousticProj + PostNet: Dual Mel-Spectrogram generator (coarse + 5-layer refined at 22.05 kHz).
-- FullVocoder: Frozen Universal HiFi-GAN Vocoder (22.05 kHz output).
+- FullVocoder: Frozen Universal HiFi-GAN Vocoder (13.93M parameters, 22.05 kHz output).
 """
 import torch
 import torch.nn as nn
@@ -71,6 +71,9 @@ class TamilTTS(nn.Module):
             hidden_dim=cfg.hidden_dim,
             style_dim=cfg.style_dim,
         )
+        # Default learned speaker embedding (used when no reference voice is provided / style dropout)
+        self.default_style = nn.Parameter(torch.randn(1, cfg.style_dim) * 0.02)
+
         self.aligner = AlignmentNetwork(
             text_dim=cfg.hidden_dim,
             mel_dim=cfg.mel_channels,
@@ -111,7 +114,7 @@ class TamilTTS(nn.Module):
             upsample_initial_channel=512,
         )
 
-    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None):
+    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None, style_dropout_p=0.5):
         """
         text_tokens: [B, T_text]
         text_lens:   [B] (actual token lengths)
@@ -134,12 +137,19 @@ class TamilTTS(nn.Module):
 
         text_mask = torch.arange(T_text, device=device).unsqueeze(0) >= text_lens.unsqueeze(1)  # True = PAD
 
-        # 1. Extract speaker style embedding from reference mel
+        # 1. Speaker Style Conditioning (with Anti-Leakage Style Dropout during training)
+        default_style_exp = self.default_style.expand(B, -1)
         if ref_mel is not None:
-            style = self.style_encoder(ref_mel)
+            # Detach ref_mel when extracting style to prevent backprop gradient shortcuts
+            style_extracted = self.style_encoder(ref_mel.detach())
+            if self.training and style_dropout_p > 0.0:
+                # 50% style dropout: forces TextEncoder to learn prosody independently
+                drop_mask = (torch.rand(B, 1, device=device) < style_dropout_p).float()
+                style = (1.0 - drop_mask) * style_extracted + drop_mask * default_style_exp
+            else:
+                style = style_extracted
         else:
-            dummy_mel = torch.full((B, 80, 50), -3.5, device=device)
-            style = self.style_encoder(dummy_mel)
+            style = default_style_exp
 
         # 2. Encode text with self-attention, positional encoding, and pad masking
         x = self.text_encoder(text_tokens, mask=text_mask)  # [B, T_text, 512]
@@ -152,7 +162,7 @@ class TamilTTS(nn.Module):
         bin_loss = torch.tensor(0.0, device=device)
 
         if self.training and ref_mel is not None and mel_lens is not None:
-            # Learned RAD-TTS Alignment Network
+            # Exact RAD-TTS Alignment Network (Forward-Sum + True Binarization on same log_A)
             align_dur, hard_path, forward_sum_loss, bin_loss = self.aligner(x, ref_mel, text_lens, mel_lens)
             durations = align_dur
             mel_len = int(mel_lens.max().item())

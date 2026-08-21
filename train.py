@@ -294,8 +294,10 @@ def train_worker(local_rank, world_size, cfg):
                     # 2. Masked Log-Duration Loss (supervised by alignment-derived durations)
                     loss_dur = log_dur_loss_fn(log_dur_pred, align_dur, text_lens=text_lens)
 
-                    # 3. RAD-TTS Forward-Sum + Binarization Alignment Loss
-                    loss_align = fwd_loss + cfg.weight_bin * bin_loss
+                    # 3. RAD-TTS Forward-Sum + Warmed-up Binarization Loss
+                    bin_warmup = getattr(cfg, "bin_warmup_steps", 5000)
+                    bin_scale = min(1.0, max(0.0, global_step / max(bin_warmup, 1)))
+                    loss_align = fwd_loss + (cfg.weight_bin * bin_scale) * bin_loss
 
                     # 4. Optional Stage 2 SLM Loss
                     loss_slm = torch.tensor(0.0, device=device)

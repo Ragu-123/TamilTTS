@@ -47,10 +47,11 @@ class Config:
     warmup_steps     = 2_000
     save_every       = 2_000
 
-    # --- Loss Weights (Staged Training) ---
+    # --- Loss Weights (Staged & Warmed-up Training) ---
     weight_mel_refined = 1.0     # PostNet refined mel loss (Masked L1)
     weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss (Masked L1)
     weight_dur         = 0.1     # Duration MSE loss on alignment-derived durations
-    weight_align       = 1.0     # RAD-TTS Forward-Sum Alignment Loss
-    weight_bin         = 0.1     # Binarization loss for sharp alignments
+    weight_align       = 1.0     # Exact RAD-TTS Forward-Sum Loss
+    weight_bin         = 1.0     # Exact RAD-TTS Binarization Loss target
+    bin_warmup_steps   = 5_000   # Binarization loss warmup (0.0 -> 1.0 over 5k steps)
     weight_slm         = 0.0     # Stage 1: 0.0 (Stage 2 after step 10k: 0.1)
