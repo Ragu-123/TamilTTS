@@ -136,7 +136,9 @@ def train_worker(local_rank, world_size, cfg):
     optimizer = Lion(model.parameters(), lr=cfg.learning_rate)
     scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, cfg.total_steps)
 
-    # 4. Critics (Dedicated copy per GPU with low_cpu_mem_usage)
+    # 4. Critics & Waveform Loss (Dedicated copy per GPU with low_cpu_mem_usage)
+    audio_mel_loss_fn = AudioMelLoss(cfg.sample_rate, cfg.n_fft, cfg.hop_length, cfg.mel_channels).to(device)
+
     log(f"  Loading WavLM       : {cfg.wavlm_dir}", local_rank)
     wavlm = WavLMModel.from_pretrained(cfg.wavlm_dir, low_cpu_mem_usage=True).to(device)
     slm_loss_fn = SLMLoss(wavlm)
@@ -243,16 +245,23 @@ def train_worker(local_rank, world_size, cfg):
                 )
 
                 # --- Losses ---
+                # 1. Acoustic Mel Reconstruction Loss
                 mel_target = ref_mel.transpose(1, 2)
                 loss_mel = F.l1_loss(mel_pred, mel_target)
 
+                # 2. HiFi-GAN Vocoder Mel Loss (Supervises raw audio waveform synthesis)
                 min_a = min(gen_audio.size(1), real_audio.size(1))
+                loss_audio_mel = audio_mel_loss_fn(gen_audio[:, :min_a], real_audio[:, :min_a])
+
+                # 3. WavLM Speech Language Model Perceptual Loss
                 loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
+                # 4. Duration Predictor Huber Loss
                 loss_dur = F.huber_loss(dur_pred, target_dur, delta=1.0)
 
                 total_loss = (
                     cfg.weight_mel * loss_mel
+                    + 45.0 * loss_audio_mel
                     + cfg.weight_slm * loss_slm
                     + cfg.weight_dur * loss_dur
                 )
@@ -273,6 +282,7 @@ def train_worker(local_rank, world_size, cfg):
                             "step": global_step,
                             "loss": f"{total_loss.item():.3f}",
                             "mel": f"{loss_mel.item():.3f}",
+                            "voc": f"{loss_audio_mel.item():.3f}",
                             "slm": f"{loss_slm.item():.3f}",
                             "dur": f"{loss_dur.item():.3f}",
                             "lr": f"{scheduler.get_last_lr()[0]:.1e}",

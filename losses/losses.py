@@ -1,6 +1,41 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms as T
+
+
+class AudioMelLoss(nn.Module):
+    """
+    HiFi-GAN Standard Differentiable Mel-Spectrogram Loss.
+    Computes mel spectrograms directly from generated audio waveform
+    and computes L1 loss against the ground-truth audio mel spectrogram.
+    
+    This is the critical loss that directly trains the FullVocoder to synthesize
+    exact acoustic frequencies and human vocal tract resonances.
+    """
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80):
+        super().__init__()
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            power=1.0,
+            normalized=False,
+        )
+
+    def forward(self, gen_audio, real_audio):
+        device = gen_audio.device
+        mel_tf = self.mel_transform.to(device)
+
+        gen_mel = torch.log(torch.clamp(mel_tf(gen_audio), min=1e-5))
+        with torch.no_grad():
+            real_mel = torch.log(torch.clamp(mel_tf(real_audio), min=1e-5))
+
+        min_t = min(gen_mel.size(-1), real_mel.size(-1))
+        return F.l1_loss(gen_mel[..., :min_t], real_mel[..., :min_t])
+
 
 class SLMLoss(nn.Module):
     """WavLM adversarial feature-matching loss. Input: [B, T] raw waveform."""
