@@ -1,1 +1,1 @@
-from .losses import AudioMelLoss, SLMLoss, SRFDLoss
+from .losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss

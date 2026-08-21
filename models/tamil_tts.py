@@ -1,12 +1,12 @@
 """
-TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / StyleTTS 2 SOTA Standard)
+TamilTTS Acoustic Model Architecture (AI4Bharat / FastPitch / Kokoro-82M SOTA Standard)
 ========================================================================================
 - TextEncoder: Transformer with padding masking and positional encoding.
-- StyleEncoder: Extracts reference speaker voice embedding.
+- StyleEncoder: Extracts reference speaker voice embedding for zero-shot voice cloning.
 - DurationPredictor + Monotonic Alignment Search (MAS): True character duration learning.
 - DiffusionProsody: Style and prosody latent modulation.
-- AcousticProj: High-resolution 80-channel Mel Spectrogram generator.
-- FullVocoder: Pre-trained Universal HiFi-GAN Vocoder for waveform synthesis.
+- AcousticProj + PostNet: Dual Mel-Spectrogram generator (coarse + 5-layer refined).
+- FullVocoder: Frozen Universal HiFi-GAN Vocoder for 100% buzz-free waveform synthesis.
 """
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from .text_encoder import TextEncoder
 from .style_encoder import StyleEncoder
 from .duration_predictor import DurationPredictor
 from .diffusion import DiffusionProsody
+from .postnet import PostNet
 from .vocoder import FullVocoder
 from .alignment import monotonic_alignment_search
 
@@ -57,11 +58,13 @@ class TamilTTS(nn.Module):
     
     Training:
       Text -> TextEncoder -> Monotonic Alignment Search (MAS) -> Duration Loss
-           -> length_regulate(MAS durations) -> DiffusionProsody -> AcousticProj -> Mel Pred (L1 Loss)
+           -> length_regulate(MAS durations) -> DiffusionProsody -> AcousticProj -> mel_coarse
+           -> PostNet -> mel_refined (Dual Mel Loss)
 
     Inference:
       Text -> TextEncoder -> DurationPredictor -> length_regulate(Predicted Durations)
-           -> DiffusionProsody -> AcousticProj -> Mel Pred -> HiFi-GAN Vocoder -> Clean 16kHz Audio
+           -> DiffusionProsody -> AcousticProj -> PostNet -> mel_refined
+           -> Pre-trained HiFi-GAN Vocoder -> Clean 22.05kHz Audio
     """
     def __init__(self, cfg):
         super().__init__()
@@ -91,6 +94,21 @@ class TamilTTS(nn.Module):
             nn.LeakyReLU(0.1),
             nn.Linear(cfg.hidden_dim // 2, cfg.mel_channels),
         )
+
+        # Kokoro / Tacotron 2 PostNet for Formant & Harmonic Refinement
+        self.postnet = PostNet(
+            mel_dim=cfg.mel_channels,
+            postnet_dim=512,
+            n_layers=5,
+            kernel_size=5,
+            dropout=0.2,
+        )
+
+        # Mel initialization matching typical log-mel distributions (prevents initial collapse)
+        with torch.no_grad():
+            self.acoustic_proj[-1].bias.fill_(-1.0)
+            self.acoustic_proj[-1].weight.mul_(0.1)
+
         self.mel_align_proj = nn.Linear(cfg.mel_channels, cfg.hidden_dim)
         self.vocoder = FullVocoder(
             in_channels=cfg.mel_channels,
@@ -105,6 +123,13 @@ class TamilTTS(nn.Module):
         target_mel_len: int (optional target frame count)
         text_mask:      [B, T_text] boolean mask (True = PAD)
         target_dur:     [B, T_text] (explicit durations, if provided)
+        
+        Returns:
+            audio:       [B, T_audio] (synthesized waveform via vocoder)
+            mel_refined: [B, mel_len, 80] (final post-PostNet mel spectrogram)
+            mel_coarse:  [B, mel_len, 80] (raw decoder mel prediction)
+            dur_pred:    [B, T_text] (predicted linear duration in frames)
+            log_dur_pred:[B, T_text] (predicted log-durations for loss)
         """
         # 1. Extract speaker style embedding from reference mel
         style = self.style_encoder(ref_mel)                          # [B, 256]
@@ -113,10 +138,9 @@ class TamilTTS(nn.Module):
         x = self.text_encoder(text_tokens, mask=text_mask)           # [B, T_text, 512]
 
         # 3. Predict durations for each character
-        dur_pred = self.duration_predictor(x, mask=text_mask)        # [B, T_text]
+        dur_pred, log_dur_pred = self.duration_predictor(x, mask=text_mask)  # [B, T_text]
 
         # 4. Determine durations for length regulation:
-        # If in training and target_dur is None: use Monotonic Alignment Search (MAS)!
         if self.training and target_dur is None and ref_mel is not None:
             with torch.no_grad():
                 mel_proj = self.mel_align_proj(ref_mel.transpose(1, 2))  # [B, T_mel, 512]
@@ -137,10 +161,12 @@ class TamilTTS(nn.Module):
         # 6. Modulate prosody & style
         latents = self.diffusion_prosody(x_expanded, style)          # [B, mel_len, 512]
 
-        # 7. Predict 80-channel Mel Spectrogram
-        mel_pred = self.acoustic_proj(latents)                       # [B, mel_len, 80]
+        # 7. Predict Coarse & Refined 80-channel Mel Spectrogram
+        mel_coarse = self.acoustic_proj(latents)                     # [B, mel_len, 80]
+        mel_residual = self.postnet(mel_coarse)                      # [B, mel_len, 80]
+        mel_refined = mel_coarse + mel_residual                      # [B, mel_len, 80]
 
         # 8. Synthesize waveform via Vocoder
-        audio = self.vocoder(mel_pred)                               # [B, T_audio]
+        audio = self.vocoder(mel_refined)                            # [B, T_audio]
 
-        return audio, mel_pred, dur_pred
+        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred

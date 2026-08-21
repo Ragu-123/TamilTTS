@@ -1,4 +1,4 @@
-"""TamilTTS Configuration — 68.55M End-to-End Pipeline."""
+"""TamilTTS Configuration — SOTA Decoupled Acoustic + Frozen HiFi-GAN Pipeline."""
 
 class Config:
     # --- Paths (Supports single path or list of paths for multi-dataset combination) ---
@@ -9,6 +9,10 @@ class Config:
     wavlm_dir      = "/kaggle/input/models/ragunathravi/wavlm-base-plus/pytorch/default/1"
     whisper_dir    = "/kaggle/input/notebooks/ragunathravi/tamil-asr/indicwhisper_tamil/tamil_models/whisper-medium-ta_alldata_multigpu"
     checkpoint_dir = "./checkpoints"
+
+    # --- Pre-trained Universal HiFi-GAN Vocoder (Frozen) ---
+    vocoder_ckpt   = "/kaggle/input/notebooks/sanjaynn/tamiltts-vocoder/indic_tts_tamil_clean/hifigan_generator.pt"
+    vocoder_config = "/kaggle/input/notebooks/sanjaynn/tamiltts-vocoder/indic_tts_tamil_clean/hifigan_config.json"
 
     # --- Model Architecture ---
     vocab_size               = 256      # Covers all Tamil Unicode (0x0B80-0x0BFF) + digits + punctuation
@@ -39,7 +43,8 @@ class Config:
     warmup_steps     = 2_000
     save_every       = 2_000
 
-    # --- Loss Weights ---
-    weight_mel = 45.0           # Standard acoustic mel reconstruction weight (HiFi-GAN / StyleTTS 2)
-    weight_slm = 1.0            # Perceptual WavLM speech language model critic
-    weight_dur = 1.0            # Duration predictor alignment loss
+    # --- Loss Weights (Kokoro / FastPitch Standard) ---
+    weight_mel_refined = 1.0     # PostNet refined mel loss
+    weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss
+    weight_dur         = 1.0     # Log-scale duration loss (MAS alignment)
+    weight_slm         = 1.0     # Perceptual WavLM speech language model critic

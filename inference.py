@@ -1,13 +1,14 @@
 """
-TamilTTS Inference Script — v3 (AI4Bharat / SOTA Architecture)
-==============================================================
-Generates clean, natural Tamil speech audio from text using trained TamilTTS checkpoint.
+TamilTTS Inference Script — v4 (SOTA AI4Bharat / Kokoro Architecture)
+=====================================================================
+Generates clean, natural, buzz-free Tamil speech audio from text using trained TamilTTS checkpoint.
 
 Features:
 - Character-level Tamil Unicode tokenization with safety boundary clamping.
+- PostNet 5-layer convolutional formant refinement.
 - Monotonic Alignment Search (MAS) duration pacing.
-- Mel-scale normalized reference audio extraction for voice cloning.
-- Pre-trained Universal HiFi-GAN Vocoder integration for 100% buzz-free audio.
+- Mel-scale normalized reference audio extraction for zero-shot voice cloning.
+- Pre-trained Frozen Universal HiFi-GAN Vocoder integration.
 - Fine-grained speed and duration control (--speed, --min_char_frames).
 
 Usage:
@@ -112,7 +113,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     x = eval_model.text_encoder(tokens, mask=text_mask)
 
     # Step B: Duration prediction with speed scaling
-    dur_pred = eval_model.duration_predictor(x, mask=text_mask)  # [1, T_text]
+    dur_pred, log_dur_pred = eval_model.duration_predictor(x, mask=text_mask)  # [1, T_text]
 
     # Apply speed and ensure minimum frames for proper syllable articulation
     non_pad = (~text_mask).float()
@@ -124,7 +125,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     total_frames = max(total_frames, 16)
 
     # Forward through model using regulated durations
-    audio, mel_pred, _ = eval_model(
+    audio, mel_refined, mel_coarse, _, _ = eval_model(
         tokens, ref_mel,
         target_mel_len=total_frames,
         text_mask=text_mask,
@@ -133,11 +134,11 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
 
     # If external universal vocoder is provided, use it for waveform synthesis
     if external_vocoder is not None:
-        audio = external_vocoder(mel_pred)
+        audio = external_vocoder(mel_refined)
 
     # 4. Post-process audio waveform
     audio_np = audio.squeeze(0).cpu().numpy()
-    mel_np = mel_pred.squeeze(0).cpu().numpy()
+    mel_np = mel_refined.squeeze(0).cpu().numpy()
 
     # Remove DC offset
     audio_np = audio_np - np.mean(audio_np)
@@ -151,7 +152,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (v3 — AI4Bharat Standard)")
+    parser = argparse.ArgumentParser(description="TamilTTS Inference Pipeline (v4 — SOTA Architecture)")
     parser.add_argument("--text", type=str, required=True, help="Tamil text to synthesize")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (best.pt)")
     parser.add_argument("--output", type=str, default="output_tamil.wav", help="Output WAV file path")
@@ -159,14 +160,15 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed (default: 1.0, 0.85=slower/clearer)")
     parser.add_argument("--min_char_frames", type=float, default=5.0,
                         help="Minimum mel frames per character (default: 5.0 = ~80ms per character)")
-    parser.add_argument("--vocoder_ckpt", type=str, default=None, help="Optional path to external universal vocoder checkpoint")
+    parser.add_argument("--vocoder_ckpt", type=str, default=None,
+                        help="Path to pre-trained universal HiFi-GAN vocoder checkpoint")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Config()
 
     print("=" * 60)
-    print("  TamilTTS Inference Pipeline (v3 — AI4Bharat Standard)")
+    print("  TamilTTS Inference Pipeline (v4 — SOTA Architecture)")
     print("=" * 60)
     print(f"  Device     : {device}")
     print(f"  Checkpoint : {args.checkpoint}")
@@ -206,11 +208,9 @@ def main():
         ref_mel = torch.tensor(mel_norm, dtype=torch.float32, device=device).unsqueeze(0)
         print(f"  Ref Voice  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
 
-    # 5. Optional external universal vocoder
-    external_vocoder = None
-    if args.vocoder_ckpt and os.path.exists(args.vocoder_ckpt):
-        print(f"  Vocoder    : Loading from {args.vocoder_ckpt}")
-        external_vocoder = load_pretrained_vocoder(device=device, checkpoint_path=args.vocoder_ckpt)
+    # 5. Load pre-trained Universal Vocoder
+    vocoder_path = args.vocoder_ckpt or cfg.vocoder_ckpt
+    external_vocoder = load_pretrained_vocoder(device=device, checkpoint_path=vocoder_path)
 
     # 6. Synthesize
     print("\n  Generating speech audio...")

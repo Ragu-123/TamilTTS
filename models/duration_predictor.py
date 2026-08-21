@@ -5,8 +5,13 @@ import torch.nn.functional as F
 
 class DurationPredictor(nn.Module):
     """
-    Predicts duration (in mel frames) for each text token.
-    Uses dilated 1D convolutions, LayerNorm, and ReLU for non-negative outputs.
+    Predicts log-duration for each text token.
+    Uses dilated 1D convolutions, LayerNorm, and linear projection.
+    
+    Predicting in log-space (Kokoro-82M / FastPitch standard) ensures:
+    1. Gradients never saturate or hit zero.
+    2. Relative syllable errors are penalized proportionally.
+    3. Outputs are always mathematically positive after torch.exp().
     """
     def __init__(self, hidden_dim=512, filter_channels=256, dropout=0.1):
         super().__init__()
@@ -24,15 +29,22 @@ class DurationPredictor(nn.Module):
         """
         x:    [B, T_text, H]
         mask: [B, T_text] boolean mask where True = PAD
-        Returns: [B, T_text] predicted duration in frames
+        Returns:
+            dur:     [B, T_text] predicted duration in frames (>= 0)
+            log_dur: [B, T_text] raw log-scale duration predictions
         """
         h = x.transpose(1, 2)
         h = F.relu(self.conv1(h))
         h = self.drop1(self.ln1(h.transpose(1, 2)).transpose(1, 2))
         h = F.relu(self.conv2(h))
         h = self.drop2(self.ln2(h.transpose(1, 2)))
-        dur = F.relu(self.proj(h).squeeze(-1))  # [B, T], non-negative
+        log_dur = self.proj(h).squeeze(-1)  # [B, T]
+
+        # Convert to linear frame duration
+        dur = torch.exp(log_dur).clamp(min=0.0, max=100.0)
 
         if mask is not None:
+            log_dur = log_dur.masked_fill(mask, -10.0)
             dur = dur.masked_fill(mask, 0.0)
-        return dur
+
+        return dur, log_dur
