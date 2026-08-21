@@ -105,9 +105,15 @@ class TamilTTS(nn.Module):
 
         # 4. Length Regulation
         # During TRAINING: use target_dur for rock-solid phoneme-to-acoustic alignment
-        # During INFERENCE: use model's predicted dur_pred
-        durations = target_dur if target_dur is not None else dur_pred
-        mel_len = target_mel_len if target_mel_len else self.max_mel_len
+        # During INFERENCE: dynamically size mel_len to match total predicted durations
+        if target_dur is not None:
+            durations = target_dur
+            mel_len = target_mel_len if target_mel_len else self.max_mel_len
+        else:
+            durations = dur_pred
+            total_dur = int(torch.clamp(torch.round(dur_pred), min=0).sum(dim=1).max().item())
+            mel_len = target_mel_len if target_mel_len else max(total_dur, 16)
+
         x_expanded = length_regulate(x, durations, max_len=mel_len)  # [B, mel_len, 512]
 
         # 5. Modulate prosody & style
