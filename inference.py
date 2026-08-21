@@ -96,10 +96,10 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None,
     tokens = torch.tensor([token_ids], dtype=torch.long, device=device)  # [1, T_text]
     text_mask = (tokens == 0)                                            # [1, T_text]
 
-    # 2. Reference mel for style extraction (Normalized to [-1.0, 1.0])
+    # 2. Reference mel for style extraction (Natural Log-Mel scale)
     if ref_mel is None:
-        # Default: True silence (-1.0)
-        ref_mel = torch.full((1, 80, 50), -1.0, device=device)
+        # Default: True acoustic silence (ln(1e-5) = -11.51)
+        ref_mel = torch.full((1, 80, 50), float(np.log(1e-5)), device=device)
     elif ref_mel.dim() == 2:
         ref_mel = ref_mel.unsqueeze(0)
     ref_mel = ref_mel.to(device)
@@ -201,11 +201,10 @@ def main():
         mel = librosa.feature.melspectrogram(
             y=audio_ref, sr=cfg.sample_rate, n_fft=cfg.n_fft,
             hop_length=cfg.hop_length, n_mels=cfg.mel_channels,
+            fmin=0.0, fmax=8000.0,
         )
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        # Normalize to [-1.0, 1.0] matching training convention
-        mel_norm = np.clip((mel_db + 80.0) / 40.0 - 1.0, -1.0, 1.0)
-        ref_mel = torch.tensor(mel_norm, dtype=torch.float32, device=device).unsqueeze(0)
+        mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))
+        ref_mel = torch.tensor(mel_log, dtype=torch.float32, device=device).unsqueeze(0)
         print(f"  Ref Voice  : {args.ref_audio} ({len(audio_ref)/sr:.1f}s)")
 
     # 5. Load pre-trained Universal Vocoder

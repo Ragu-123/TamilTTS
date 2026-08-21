@@ -106,7 +106,7 @@ class TamilTTS(nn.Module):
 
         # Mel initialization matching typical log-mel distributions (prevents initial collapse)
         with torch.no_grad():
-            self.acoustic_proj[-1].bias.fill_(-1.0)
+            self.acoustic_proj[-1].bias.fill_(-3.5)
             self.acoustic_proj[-1].weight.mul_(0.1)
 
         self.mel_align_proj = nn.Linear(cfg.mel_channels, cfg.hidden_dim)

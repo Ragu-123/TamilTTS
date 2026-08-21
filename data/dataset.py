@@ -210,25 +210,24 @@ class DirectParquetTamilDataset(Dataset):
                 if len(audio_array) < 3200:
                     continue
 
-                # Compute Mel Spectrogram on clean unpadded audio
+                # Compute standard Natural Log-Mel Spectrogram (HiFi-GAN / Kokoro standard)
                 mel = librosa.feature.melspectrogram(
                     y=audio_array, sr=self.sr, n_fft=self.n_fft,
                     hop_length=self.hop_length, n_mels=self.mel_channels,
+                    fmin=0.0, fmax=8000.0,
                 )
-                mel_db = librosa.power_to_db(mel, ref=np.max)  # [-80.0, 0.0]
+                mel_log = np.log(np.clip(mel, a_min=1e-5, a_max=None))  # Standard range: [-11.51, ~2.0]
 
-                # Normalize to [-1.0, 1.0] (silence is -1.0, loud is +1.0)
-                mel_norm = np.clip((mel_db + 80.0) / 40.0 - 1.0, -1.0, 1.0)
-
-                # Pad or truncate Mel Spectrogram with SILENCE (-1.0)
-                if mel_norm.shape[1] > self.max_mel_len:
-                    mel_norm = mel_norm[:, :self.max_mel_len]
+                # Pad or truncate Mel Spectrogram with true acoustic silence (ln(1e-5) = -11.51)
+                silence_val = float(np.log(1e-5))
+                if mel_log.shape[1] > self.max_mel_len:
+                    mel_log = mel_log[:, :self.max_mel_len]
                 else:
-                    mel_norm = np.pad(
-                        mel_norm,
-                        ((0, 0), (0, self.max_mel_len - mel_norm.shape[1])),
+                    mel_log = np.pad(
+                        mel_log,
+                        ((0, 0), (0, self.max_mel_len - mel_log.shape[1])),
                         mode="constant",
-                        constant_values=-1.0,
+                        constant_values=silence_val,
                     )
 
                 # Pad or truncate raw audio with SILENCE (0.0)
@@ -242,7 +241,7 @@ class DirectParquetTamilDataset(Dataset):
                         constant_values=0.0,
                     )
 
-                mel_tensor = torch.tensor(mel_norm, dtype=torch.float32)       # [80, max_mel_len]
+                mel_tensor = torch.tensor(mel_log, dtype=torch.float32)        # [80, max_mel_len]
                 audio_tensor = torch.tensor(audio_array, dtype=torch.float32)  # [max_audio_len]
 
                 return token_ids, mel_tensor, audio_tensor
@@ -252,7 +251,7 @@ class DirectParquetTamilDataset(Dataset):
 
         # Ultimate fallback: return a neutral silence sample rather than raising RuntimeError
         token_ids = torch.zeros(self.max_text_len, dtype=torch.long)
-        mel_tensor = torch.full((self.mel_channels, self.max_mel_len), -1.0, dtype=torch.float32)
+        mel_tensor = torch.full((self.mel_channels, self.max_mel_len), float(np.log(1e-5)), dtype=torch.float32)
         audio_tensor = torch.zeros(self.max_audio_len, dtype=torch.float32)
         return token_ids, mel_tensor, audio_tensor
 
