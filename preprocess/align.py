@@ -9,12 +9,14 @@ def run_mfa_alignment(corpus_dir, dict_path, model_path, output_dir, mfa_bin="mf
     mfa_dir = os.path.dirname(mfa_bin) if os.path.isabs(mfa_bin) else ""
     mfa_root = os.path.dirname(mfa_dir) if mfa_dir else "/kaggle/working/mfa_env"
 
-    # Auto-detect the actual python binary (python3.14, python3.12, python3, python)
+    # Auto-detect the actual python binary — exclude -config, .py, .m scripts
     python_bin = "python"
     if mfa_dir:
+        import re
         for name in sorted(os.listdir(mfa_dir), reverse=True):
-            if name.startswith("python3") and os.path.isfile(os.path.join(mfa_dir, name)):
-                python_bin = os.path.join(mfa_dir, name)
+            full = os.path.join(mfa_dir, name)
+            if re.match(r"^python3(\.\d+)?$", name) and os.path.isfile(full):
+                python_bin = full
                 break
 
     # Set OMP_NUM_THREADS=1 so all 48 workers run at 100% CPU without thread contention
