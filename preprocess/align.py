@@ -5,47 +5,24 @@ import os, glob, time, shutil, subprocess, textgrid, torch
 
 def run_mfa_alignment(corpus_dir, dict_path, model_path, output_dir, mfa_bin="mfa", jobs=4):
     os.makedirs(output_dir, exist_ok=True)
-    env = os.environ.copy()
     mfa_dir = os.path.dirname(mfa_bin) if os.path.isabs(mfa_bin) else ""
-    if mfa_dir:
-        mfa_root = os.path.dirname(mfa_dir)
-        env["PATH"] = f"{mfa_dir}:{env.get('PATH', '')}"
-        env["LD_LIBRARY_PATH"] = f"{mfa_root}/lib:{env.get('LD_LIBRARY_PATH', '')}"
-        env["CONDA_PREFIX"] = mfa_root
+    mfa_root = os.path.dirname(mfa_dir) if mfa_dir else "/kaggle/working/mfa_env"
+    python_bin = os.path.join(mfa_dir, "python") if mfa_dir and os.path.exists(os.path.join(mfa_dir, "python")) else "python"
 
-    # Use mfa_env python binary if present to avoid shebang path issues
-    python_bin = os.path.join(mfa_dir, "python") if mfa_dir and os.path.exists(os.path.join(mfa_dir, "python")) else (mfa_bin if os.path.exists(mfa_bin) else "mfa")
-
-    if python_bin.endswith("python") or python_bin.endswith("python3"):
-        cmd = [
-            python_bin, "-m", "montreal_forced_aligner.command_line.mfa", "align",
-            "--clean",
-            "--use_mp",
-            "-j", str(jobs),
-            "--single_speaker",
-            "--no_textgrid_cleanup",
-            corpus_dir,
-            dict_path,
-            model_path,
-            output_dir
-        ]
-    else:
-        cmd = [
-            mfa_bin, "align",
-            "--clean",
-            "--use_mp",
-            "-j", str(jobs),
-            "--single_speaker",
-            "--no_textgrid_cleanup",
-            corpus_dir,
-            dict_path,
-            model_path,
-            output_dir
-        ]
+    # Construct robust bash command ensuring ld.so loads all Kaldi/OpenFST shared libraries
+    bash_cmd = (
+        f"export CONDA_PREFIX='{mfa_root}'; "
+        f"export PATH='{mfa_root}/bin:'\"$PATH\"; "
+        f"export LD_LIBRARY_PATH='{mfa_root}/lib:'\"$LD_LIBRARY_PATH\"; "
+        f"'{python_bin}' -m montreal_forced_aligner.command_line.mfa align "
+        f"--clean --use_mp -j {jobs} --single_speaker --no_textgrid_cleanup "
+        f"'{corpus_dir}' '{dict_path}' '{model_path}' '{output_dir}'"
+    )
 
     t0 = time.time()
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    res = subprocess.run(["bash", "-c", bash_cmd], capture_output=True, text=True)
     elapsed = time.time() - t0
+
     if res.returncode != 0:
         print(f"\n  ⚠️ MFA Exit Code {res.returncode}:")
         if res.stderr:
