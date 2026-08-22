@@ -1,10 +1,11 @@
 """
-TamilTTS Dataset Preprocessing & Forced Alignment CLI
-======================================================
+TamilTTS High-Throughput Preprocessing & Forced Alignment CLI
+============================================================
 Industry standard data alignment, G2G tokenization, and duration extraction
 powered by AI4Bharat IndicMFA.
 
 Features:
+- Parallel 48-core WAV/G2G export & parallel TextGrid parsing.
 - Auto-detects and maximizes all available CPU cores.
 - Live, smooth tqdm progress bar tracking total aligned samples and ETA.
 - Resumable checkpointing to .pt dictionary.
@@ -19,13 +20,15 @@ import shutil
 import argparse
 import urllib.request
 import multiprocessing
+import numpy as np
 import torch
 import soundfile as sf
 import pyarrow.parquet as pq
+from concurrent.futures import ThreadPoolExecutor
 from tqdm.auto import tqdm
 
 from preprocess.g2g import segment_tamil_g2g, load_g2g_dictionary
-from preprocess.align import run_mfa_alignment, extract_durations_from_textgrid
+from preprocess.align import run_mfa_alignment, parse_single_textgrid
 
 def decode_audio_sample(row):
     audio_val = row.get("audio")
@@ -58,6 +61,8 @@ def decode_audio_sample(row):
             arr, orig_sr = sf.read(p)
             return arr, orig_sr
 
+    return None, None
+
 def download_indic_mfa_assets(dest_dir="indic_mfa_tamil"):
     os.makedirs(dest_dir, exist_ok=True)
     dict_path = os.path.join(dest_dir, "Tamil_Dictionary_g2g.txt")
@@ -83,11 +88,38 @@ def download_indic_mfa_assets(dest_dir="indic_mfa_tamil"):
 
     return dict_path, model_zip
 
+def export_single_sample(item_tuple, temp_corpus, g2g_entries):
+    key, p_path, rg_idx, r_idx = item_tuple
+    try:
+        pf = pq.ParquetFile(p_path)
+        table = pf.read_row_group(rg_idx)
+        row = {col: table[col][r_idx].as_py() for col in table.column_names}
+        text = (row.get("normalized") or row.get("text") or row.get("verbatim") or "").strip()
+        if not text:
+            return False
+
+        arr, orig_sr = decode_audio_sample(row)
+        if arr is None or len(arr) < 100:
+            return False
+
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+
+        wav_p = os.path.join(temp_corpus, f"{key}.wav")
+        txt_p = os.path.join(temp_corpus, f"{key}.txt")
+
+        sf.write(wav_p, arr, orig_sr)
+        g2g_str = segment_tamil_g2g(text, g2g_entries)
+        with open(txt_p, "w", encoding="utf-8") as f:
+            f.write(g2g_str)
+        return True
+    except Exception:
+        return False
 
 def main():
     max_cores = max(1, os.cpu_count() or multiprocessing.cpu_count())
 
-    parser = argparse.ArgumentParser(description="TamilTTS IndicMFA Preprocessor")
+    parser = argparse.ArgumentParser(description="TamilTTS High-Throughput IndicMFA Preprocessor")
     parser.add_argument("--dataset_dirs", nargs="+", default=[
         "/kaggle/input/datasets/ragunathravi/ai4bharat-indicvoices-r-tamil",
         "/kaggle/input/datasets/ragunathravi/ai4bharat-rasa-tamil",
@@ -97,8 +129,8 @@ def main():
     parser.add_argument("--output_file", default="/kaggle/working/tamil_mfa_durations_76k.pt")
     parser.add_argument("--temp_corpus", default="/kaggle/working/temp_mfa_corpus")
     parser.add_argument("--temp_textgrids", default="/kaggle/working/temp_mfa_textgrids")
-    parser.add_argument("--chunk_size", type=int, default=2000)
-    parser.add_argument("--limit_samples", type=int, default=0, help="0 for all, or N for quick check")
+    parser.add_argument("--chunk_size", type=int, default=4000)
+    parser.add_argument("--limit_samples", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=max_cores, help=f"CPU threads to use (default: {max_cores})")
     parser.add_argument("--hop_length", type=int, default=256)
     parser.add_argument("--sample_rate", type=int, default=22050)
@@ -108,8 +140,8 @@ def main():
     g2g_entries = load_g2g_dictionary(dict_path)
 
     print("\n" + "=" * 70)
-    print("  TamilTTS Preprocessing & Alignment Pipeline (IndicMFA)")
-    print(f"  • CPU Cores Activated: {args.jobs} cores (Max Available)")
+    print("  TamilTTS High-Throughput Preprocessing & Alignment (IndicMFA)")
+    print(f"  • CPU Cores Activated: {args.jobs} cores (Max Available Parallelism)")
     print(f"  • Chunk Size         : {args.chunk_size:,} samples / batch")
     print(f"  • G2G Vocabulary     : {len(g2g_entries):,} graphemes loaded")
     print("=" * 70)
@@ -186,49 +218,25 @@ def main():
         if not to_process:
             continue
 
-        pbar.set_description(f"Chunk {chunk_idx+1}/{num_chunks} (Exporting {len(to_process)} wavs)")
+        pbar.set_description(f"Chunk {chunk_idx+1}/{num_chunks} (Parallel exporting {len(to_process)} wavs)")
 
         shutil.rmtree(args.temp_corpus, ignore_errors=True)
         shutil.rmtree(args.temp_textgrids, ignore_errors=True)
         os.makedirs(args.temp_corpus, exist_ok=True)
         os.makedirs(args.temp_textgrids, exist_ok=True)
 
-        exported = 0
-        cur_pf, cur_table = None, None
-        for key, p_path, rg_idx, r_idx in to_process:
-            try:
-                if cur_pf != (p_path, rg_idx):
-                    pf = pq.ParquetFile(p_path)
-                    cur_table = pf.read_row_group(rg_idx)
-                    cur_pf = (p_path, rg_idx)
-
-                row = {col: cur_table[col][r_idx].as_py() for col in cur_table.column_names}
-                text = (row.get("normalized") or row.get("text") or row.get("verbatim") or "").strip()
-                if not text:
-                    continue
-
-                arr, orig_sr = decode_audio_sample(row)
-                if arr is None or len(arr) < 100:
-                    continue
-
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=1)
-
-                wav_p = os.path.join(args.temp_corpus, f"{key}.wav")
-                txt_p = os.path.join(args.temp_corpus, f"{key}.txt")
-
-                sf.write(wav_p, arr, orig_sr)
-                g2g_str = segment_tamil_g2g(text, g2g_entries)
-                with open(txt_p, "w", encoding="utf-8") as f:
-                    f.write(g2g_str)
-                exported += 1
-            except Exception:
-                continue
+        # Parallel Export across all CPU cores
+        with ThreadPoolExecutor(max_workers=min(args.jobs, 32)) as pool:
+            export_results = list(pool.map(
+                lambda item: export_single_sample(item, args.temp_corpus, g2g_entries),
+                to_process
+            ))
+        exported = sum(1 for r in export_results if r)
 
         if exported == 0:
             continue
 
-        pbar.set_description(f"Chunk {chunk_idx+1}/{num_chunks} (MFA aligning on {args.jobs} cores)")
+        pbar.set_description(f"Chunk {chunk_idx+1}/{num_chunks} (MFA aligning {exported} files on {args.jobs} cores)")
         success, elapsed = run_mfa_alignment(
             args.temp_corpus, dict_path, model_path, args.temp_textgrids,
             mfa_bin=args.mfa_bin, jobs=args.jobs
@@ -237,20 +245,19 @@ def main():
         tg_files = glob.glob(os.path.join(args.temp_textgrids, "*.TextGrid"))
         speed = len(tg_files) / max(elapsed, 0.1)
 
-        # Parse TextGrids
-        for tg_p in tg_files:
-            try:
-                key = os.path.splitext(os.path.basename(tg_p))[0]
-                durs, toks = extract_durations_from_textgrid(
-                    tg_p, hop_length=args.hop_length, sample_rate=args.sample_rate
-                )
-                if durs:
-                    durations_cache[key] = {
-                        "durations": durs,
-                        "tokens": toks
-                    }
-            except Exception:
-                continue
+        # Parallel Parse TextGrids across all CPU cores
+        with ThreadPoolExecutor(max_workers=min(args.jobs, 32)) as pool:
+            parse_results = list(pool.map(
+                lambda tg_p: parse_single_textgrid(tg_p, args.hop_length, args.sample_rate),
+                tg_files
+            ))
+
+        for key, durs, toks in parse_results:
+            if key and durs:
+                durations_cache[key] = {
+                    "durations": durs,
+                    "tokens": toks
+                }
 
         # Save checkpoint to disk
         torch.save(durations_cache, args.output_file)
@@ -274,7 +281,6 @@ def main():
     print(f"  • Total Samples Aligned: {len(durations_cache):,}")
     print(f"  • Checkpoint File      : {args.output_file} ({os.path.getsize(args.output_file)/(1024*1024):.1f} MB)")
     print("=" * 70 + "\n")
-
 
 if __name__ == "__main__":
     main()
