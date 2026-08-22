@@ -104,9 +104,9 @@ class TamilTTS(nn.Module):
             dropout=0.1,
         )
 
-        # Mel initialization matching natural log-mel distributions (mean ~ -6.5)
+        # Mel initialization matching IndicTTS mel distribution (mean ~ -2.5, range [-4.0, 4.0])
         nn.init.normal_(self.acoustic_proj[-1].weight, std=0.02)
-        nn.init.constant_(self.acoustic_proj[-1].bias, -6.5)
+        nn.init.constant_(self.acoustic_proj[-1].bias, -2.5)
 
         self.vocoder = FullVocoder(
             in_channels=cfg.mel_channels,

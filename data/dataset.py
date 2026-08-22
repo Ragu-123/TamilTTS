@@ -50,6 +50,47 @@ TAMIL_G2G_TOKENS = [
     '.', ',', '!', '?', ';', ':', '-', "'", '"', '(', ')'
 ]
 
+class IndicTTSMelProcessor(torch.nn.Module):
+    """
+    Exact IndicTTS / Coqui TTS Mel-Spectrogram Processor (100% matched to frozen vocoder).
+    """
+    def __init__(self, sample_rate=22050, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.register_buffer("window", torch.hann_window(n_fft))
+        fb = AF.melscale_fbanks(
+            n_freqs=(n_fft // 2) + 1,
+            f_min=fmin,
+            f_max=fmax,
+            n_mels=n_mels,
+            sample_rate=sample_rate,
+            norm="slaney",
+            mel_scale="slaney"
+        ).transpose(0, 1) # [80, 513]
+        self.register_buffer("mel_basis", fb)
+
+    def forward(self, audio):
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        pad = int((self.n_fft - self.hop_length) / 2)
+        audio_padded = torch.nn.functional.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
+        stft = torch.stft(
+            audio_padded, self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+            window=self.window, center=False, return_complex=True
+        )
+        spec = (torch.abs(stft) + 1e-9) ** 1.5
+        mel = torch.matmul(self.mel_basis, spec)
+        mel_db = 20.0 * torch.log10(torch.clamp(mel, min=1e-5)) - 20.0
+        min_level_db = -100.0
+        max_norm = 4.0
+        mel_norm = ((mel_db - min_level_db) / (-min_level_db)) * 2.0 * max_norm - max_norm
+        mel_norm = torch.clamp(mel_norm, -max_norm, max_norm)
+        return mel_norm
+
+
 def build_tamil_vocab(max_vocab=384):
     char2id = {tok: idx for idx, tok in enumerate(TAMIL_G2G_TOKENS)}
     return char2id, max_vocab
@@ -229,25 +270,15 @@ class DirectParquetTamilDataset(Dataset):
                 if audio_len < self.min_audio_len or audio_len > self.max_audio_len:
                     continue
 
-                # 3. Compute Natural Log-Mel Spectrogram (22.05 kHz Magnitude)
+                # 3. Compute IndicTTS / Coqui TTS Normalized Mel Spectrogram (22.05 kHz)
                 audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
-                if not hasattr(self, "_mel_transform") or self._mel_transform is None:
-                    import torchaudio.transforms as T
-                    self._mel_transform = T.MelSpectrogram(
-                        sample_rate=self.sr,
-                        n_fft=self.n_fft,
-                        win_length=self.n_fft,
-                        hop_length=self.hop_length,
-                        f_min=self.f_min,
-                        f_max=self.f_max,
-                        n_mels=self.mel_channels,
-                        power=1.0,
-                        norm="slaney",
-                        mel_scale="slaney",
+                if not hasattr(self, "mel_processor") or self.mel_processor is None:
+                    self.mel_processor = IndicTTSMelProcessor(
+                        sample_rate=self.sr, n_fft=self.n_fft, hop_length=self.hop_length,
+                        n_mels=self.mel_channels, fmin=self.f_min, fmax=self.f_max
                     )
 
-                mel = self._mel_transform(audio_tensor)
-                mel_log = torch.log(torch.clamp(mel, min=1e-5))
+                mel_log = self.mel_processor(audio_tensor).squeeze(0)
                 mel_len = mel_log.shape[1]
 
                 if mel_len < 4 or mel_len < text_len:
@@ -277,9 +308,9 @@ class DirectParquetTamilDataset(Dataset):
             except Exception:
                 continue
 
-        # Neutral fallback
+        # Fallback dummy sample in case of catastrophic read errors
         dummy_ids = torch.tensor([1, 2], dtype=torch.long)
-        dummy_mel = torch.full((self.mel_channels, 16), -11.5, dtype=torch.float32)
+        dummy_mel = torch.full((self.mel_channels, 16), -4.0, dtype=torch.float32)
         dummy_audio = torch.zeros(16 * self.hop_length, dtype=torch.float32)
         dummy_dur = torch.tensor([8, 8], dtype=torch.long)
         return dummy_ids, 2, dummy_mel, 16, dummy_audio, 16 * self.hop_length, dummy_dur
