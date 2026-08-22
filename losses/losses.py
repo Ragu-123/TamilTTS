@@ -73,6 +73,9 @@ class LogDurationLoss(nn.Module):
             loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         else:
             loss = loss.mean()
+        return loss
+
+
 class PitchLoss(nn.Module):
     """
     Masked Log-F0 Pitch Loss.
