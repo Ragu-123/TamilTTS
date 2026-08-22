@@ -352,3 +352,40 @@ def tamil_tts_collate_fn(batch):
 
 # Aliases for backward compatibility
 TamilTTSDataset = DirectParquetTamilDataset
+
+
+def build_tamil_datasets(dataset_dirs, cfg, val_split=0.02):
+    """
+    Build deterministic train and validation datasets from parquet directories.
+    """
+    if isinstance(dataset_dirs, str):
+        dataset_dirs = [dataset_dirs]
+
+    parquet_files = []
+    for d in dataset_dirs:
+        found = sorted(glob.glob(os.path.join(d, "**", "*.parquet"), recursive=True))
+        parquet_files.extend(found)
+
+    parquet_files = sorted(list(set(parquet_files)))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {dataset_dirs}")
+
+    full_ds = DirectParquetTamilDataset(parquet_files, cfg)
+
+    total_samples = len(full_ds)
+    val_size = max(int(total_samples * val_split), 20)
+    train_size = total_samples - val_size
+
+    indices = list(range(total_samples))
+    import random
+    rng = random.Random(42)
+    rng.shuffle(indices)
+
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+
+    train_ds = torch.utils.data.Subset(full_ds, train_indices)
+    val_ds = torch.utils.data.Subset(full_ds, val_indices)
+
+    return train_ds, val_ds
+
