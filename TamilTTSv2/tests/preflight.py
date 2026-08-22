@@ -57,17 +57,24 @@ def fake_batch(cfg, B=2, Tt=14, Tm=48, device="cpu"):
 
 def gate3_gradient_flow(model, batch, device):
     print("\n" + "=" * 60)
-    print("GATE 3: Gradient Flow Audit")
+    print("GATE 3: Gradient Flow Audit (full regression objective)")
     print("=" * 60)
+    ref_mel = torch.roll(batch["mel"], shifts=1, dims=0)      # exercise style_encoder
     out = model(
         batch["tokens"], batch["token_lens"],
         mel=batch["mel"], mel_lens=batch["mel_lens"],
         gt_dur=batch["gt_dur"], gt_logf0=batch["log_f0"], voiced=batch["voiced"],
         gt_energy=batch["energy"],
-        ref_mel=None, style_dropout=0.0, return_audio=False,
+        ref_mel=ref_mel, style_dropout=0.0, return_audio=False,
     )
-    target = torch.randn_like(out["mel_pred"]) * 0.5
-    loss = F.l1_loss(out["mel_pred"], target)
+    mel_fn = MelLoss(coarse_w=0.5, refined_w=1.0)
+    dur_fn = DurationLoss()
+    pe_fn = PitchEnergyLoss()
+    l_mel, _, _ = mel_fn(out["mel_pred"], out["mel_coarse"], batch["mel"], mel_lens=batch["mel_lens"])
+    l_dur = dur_fn(out["log_dur"], batch["gt_dur"], token_lens=batch["token_lens"])
+    l_f0, l_en = pe_fn(out["log_f0"], out["energy"], batch["log_f0"], batch["voiced"],
+                       batch["energy"], mel_lens=batch["mel_lens"])
+    loss = l_mel + l_dur + l_f0 + l_en
     loss.backward()
 
     bad = []
@@ -122,9 +129,10 @@ def gate2_teacher_forcing_fit(model, cfg, device, steps=300):
             ref_mel=torch.roll(b["mel"], 1, 0), ref_mel_lens=torch.roll(b["mel_lens"], 1),
             style_dropout=cfg.style_dropout_p, return_audio=False,
         )
-        l_mel, _, _ = mel_fn(out["mel_pred"], out["mel_coarse"], b["mel"].transpose(1, 2), lens=b["mel_lens"])
-        l_dur = dur_fn(out["log_dur"], b["gt_dur"], lens=b["token_lens"])
-        l_f0, l_en = pe_fn(out["log_f0"], b["log_f0"], b["voiced"], out["energy"], b["energy"], b["mel_lens"])
+        l_mel, _, _ = mel_fn(out["mel_pred"], out["mel_coarse"], b["mel"], mel_lens=b["mel_lens"])
+        l_dur = dur_fn(out["log_dur"], b["gt_dur"], token_lens=b["token_lens"])
+        l_f0, l_en = pe_fn(out["log_f0"], out["energy"], b["log_f0"], b["voiced"],
+                           b["energy"], mel_lens=b["mel_lens"])
         loss = l_mel + cfg.weight_dur * l_dur + cfg.weight_f0 * l_f0 + cfg.weight_energy * l_en
         opt.zero_grad()
         loss.backward()

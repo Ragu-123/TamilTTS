@@ -75,12 +75,14 @@ class PositionalEncoding(nn.Module):
 class FiLM(nn.Module):
     """
     Feature-wise Linear Modulation: style -> (gamma, beta).
-    Zero-initialized so modulation starts as identity.
+    Small-random weight init: modulation starts near-identity while still
+    letting gradients flow into the style vector on the first backward
+    (exact zero-init would cut the style gradient entirely).
     """
     def __init__(self, style_dim, hidden_dim):
         super().__init__()
         self.proj = nn.Linear(style_dim, 2 * hidden_dim)
-        nn.init.zeros_(self.proj.weight)
+        nn.init.normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, style):
