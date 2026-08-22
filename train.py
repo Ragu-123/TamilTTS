@@ -26,7 +26,7 @@ from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
 from config import Config
 from models import TamilTTS
 from models.vocoder import load_pretrained_vocoder
-from losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss
+from losses import DualMelLoss, LogDurationLoss, SLMLoss, SRFDLoss, PitchLoss
 from data import build_tamil_datasets
 from data.dataset import tamil_tts_collate_fn
 from utils import save_checkpoint, load_checkpoint, count_parameters, get_lr_scheduler
@@ -175,6 +175,7 @@ def train_worker(local_rank, world_size, cfg):
     # 3. Loss Functions
     dual_mel_loss_fn = DualMelLoss(coarse_weight=cfg.weight_mel_coarse, refined_weight=cfg.weight_mel_refined)
     log_dur_loss_fn  = LogDurationLoss()
+    pitch_loss_fn    = PitchLoss()
 
     log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
     whisper_model = WhisperModel.from_pretrained(cfg.whisper_dir, low_cpu_mem_usage=True)
