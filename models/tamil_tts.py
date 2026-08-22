@@ -104,10 +104,9 @@ class TamilTTS(nn.Module):
             dropout=0.1,
         )
 
-        # Mel initialization matching natural log-mel distributions (mean ~ -3.5)
-        with torch.no_grad():
-            self.acoustic_proj[-1].bias.fill_(-3.5)
-            self.acoustic_proj[-1].weight.mul_(0.1)
+        # Mel initialization matching natural log-mel distributions (mean ~ -6.5)
+        nn.init.normal_(self.acoustic_proj[-1].weight, std=0.02)
+        nn.init.constant_(self.acoustic_proj[-1].bias, -6.5)
 
         self.vocoder = FullVocoder(
             in_channels=cfg.mel_channels,

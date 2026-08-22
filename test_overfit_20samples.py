@@ -145,27 +145,36 @@ def main():
     with torch.no_grad():
         for i in range(min(5, len(dataset))):
             sample = dataset[i]
-            toks, t_len, _, m_len, _, _, true_dur = sample
+            toks, t_len, sample_mel, m_len, _, _, true_dur = sample
             toks_t = toks.unsqueeze(0).to(device)
             t_len_t = torch.tensor([t_len], dtype=torch.long, device=device)
+            sample_mel_t = sample_mel.unsqueeze(0).to(device)
             true_dur_t = true_dur.unsqueeze(0).to(device).float()
 
-            # Test A: Pure Acoustic Network Synthesis (Using Original Ground-Truth MFA Durations)
+            # Test A: Pure Acoustic Network Synthesis (Using Original Ground-Truth MFA Durations + Speaker Style)
             audio_mfa, mel_mfa, _, _, _, _, _, _ = model(
                 toks_t, t_len_t,
+                ref_mel=sample_mel_t,
                 target_dur=true_dur_t,
                 return_audio=True
             )
             wav_mfa = audio_mfa.squeeze().cpu().numpy()
+            max_val = np.abs(wav_mfa).max()
+            if max_val > 0.001:
+                wav_mfa = (wav_mfa / max_val) * 0.95
             mfa_path = os.path.join(output_dir, f"sample_{i+1}_mfa_durations.wav")
             sf.write(mfa_path, wav_mfa, cfg.sample_rate)
 
             # Test B: Duration Predictor Inference Mode (Using Model-Predicted Durations)
             audio_pred, mel_pred, _, dur_pred, _, _, _, _ = model(
                 toks_t, t_len_t,
+                ref_mel=sample_mel_t,
                 return_audio=True
             )
             wav_pred = audio_pred.squeeze().cpu().numpy()
+            max_val_pred = np.abs(wav_pred).max()
+            if max_val_pred > 0.001:
+                wav_pred = (wav_pred / max_val_pred) * 0.95
             pred_path = os.path.join(output_dir, f"sample_{i+1}_predicted_durations.wav")
             sf.write(pred_path, wav_pred, cfg.sample_rate)
 
