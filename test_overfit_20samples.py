@@ -102,7 +102,7 @@ def main():
 
             optimizer.zero_grad()
 
-            gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, _, _ = model(
+            gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, _, _, _ = model(
                 text_tokens, text_lens,
                 ref_mel=ref_mel,
                 mel_lens=mel_lens,
@@ -136,7 +136,7 @@ def main():
 
     pbar.close()
     elapsed = time.time() - start_time
-    print(f"\n🎉 500-step overfit finished in {elapsed:.1f}s!")
+    print(f"\n🎉 2000-step overfit finished in {elapsed:.1f}s!")
 
     # 6. Dual-Mode Evaluation & Audio Synthesis
     print("\n" + "=" * 65)
@@ -153,7 +153,7 @@ def main():
             true_dur_t = true_dur.unsqueeze(0).to(device).float()
 
             # Test A: Pure Acoustic Network Synthesis (Using Original Ground-Truth MFA Durations + Speaker Style)
-            audio_mfa, mel_mfa, _, _, _, _, _, _ = model(
+            audio_mfa, mel_mfa, _, _, _, _, _, _, _ = model(
                 toks_t, t_len_t,
                 ref_mel=sample_mel_t,
                 target_dur=true_dur_t,
@@ -167,7 +167,7 @@ def main():
             sf.write(mfa_path, wav_mfa, cfg.sample_rate)
 
             # Test B: Duration Predictor Inference Mode (Using Model-Predicted Durations)
-            audio_pred, mel_pred, _, dur_pred, _, _, _, _ = model(
+            audio_pred, mel_pred, _, dur_pred, _, _, _, _, _ = model(
                 toks_t, t_len_t,
                 ref_mel=sample_mel_t,
                 return_audio=True

@@ -73,6 +73,32 @@ class LogDurationLoss(nn.Module):
             loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         else:
             loss = loss.mean()
+class PitchLoss(nn.Module):
+    """
+    Masked Log-F0 Pitch Loss.
+    Supervises the PitchPredictor against continuous pitch contours.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, f0_pred, f0_target, mel_lens=None):
+        """
+        f0_pred:   [B, T_mel, 1]
+        f0_target: [B, T_mel, 1]
+        mel_lens:  [B]
+        """
+        min_t = min(f0_pred.size(1), f0_target.size(1))
+        f0_pred = f0_pred[:, :min_t]
+        f0_target = f0_target[:, :min_t]
+
+        loss = F.mse_loss(f0_pred, f0_target, reduction='none')
+
+        if mel_lens is not None:
+            device = f0_pred.device
+            mask = (torch.arange(min_t, device=device).unsqueeze(0) < mel_lens.unsqueeze(1)).unsqueeze(-1).float()
+            loss = (loss * mask).sum() / (mask.sum() + 1e-6)
+        else:
+            loss = loss.mean()
         return loss
 
 

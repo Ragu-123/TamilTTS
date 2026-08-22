@@ -53,6 +53,40 @@ def length_regulate(x, durations, max_len=None):
     return output
 
 
+class PitchPredictor(nn.Module):
+    """
+    FastPitch / StyleTTS 2 F0 Pitch Predictor & Embedding.
+    Predicts continuous log-F0 pitch contour per mel frame.
+    """
+    def __init__(self, hidden_dim=512, filter_channels=256, kernel_size=5, dropout=0.1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(hidden_dim, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm1 = nn.GroupNorm(8, filter_channels)
+        self.conv2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm2 = nn.GroupNorm(8, filter_channels)
+        self.proj = nn.Conv1d(filter_channels, 1, 1)  # log-F0 prediction
+        self.pitch_embed = nn.Sequential(
+            nn.Conv1d(1, hidden_dim, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1),
+        )
+
+    def forward(self, x, f0_target=None):
+        """
+        x: [B, T_mel, hidden_dim]
+        f0_target: [B, T_mel, 1] or None
+        """
+        h = x.transpose(1, 2)
+        h = F.leaky_relu(self.norm1(self.conv1(h)), 0.1)
+        h = F.leaky_relu(self.norm2(self.conv2(h)), 0.1)
+        f0_pred = self.proj(h).transpose(1, 2)  # [B, T_mel, 1]
+
+        f0_used = f0_target if (f0_target is not None) else f0_pred
+        pitch_emb = self.pitch_embed(f0_used.transpose(1, 2)).transpose(1, 2)
+
+        return x + pitch_emb, f0_pred
+
+
 class TamilTTS(nn.Module):
     """
     Complete End-to-End TamilTTS Architecture.
@@ -83,6 +117,10 @@ class TamilTTS(nn.Module):
             hidden_dim=cfg.hidden_dim,
             filter_channels=cfg.duration_filter_channels,
         )
+        self.pitch_predictor = PitchPredictor(
+            hidden_dim=cfg.hidden_dim,
+            filter_channels=getattr(cfg, "pitch_filter_channels", 256),
+        )
         self.diffusion_prosody = DiffusionProsody(
             in_channels=cfg.hidden_dim,
             style_dim=cfg.style_dim,
@@ -108,18 +146,18 @@ class TamilTTS(nn.Module):
         nn.init.normal_(self.acoustic_proj[-1].weight, std=0.02)
         nn.init.constant_(self.acoustic_proj[-1].bias, -2.5)
 
-        self.vocoder = FullVocoder(
-            in_channels=cfg.mel_channels,
-            upsample_initial_channel=512,
-        )
+        # Universal Pre-trained HiFi-GAN Vocoder (Frozen)
+        vocoder_path = getattr(cfg, "vocoder_ckpt", None)
+        self.vocoder = load_pretrained_vocoder(checkpoint_path=vocoder_path, device="cpu")
 
-    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None, style_dropout_p=0.5, return_audio=False):
+    def forward(self, text_tokens, text_lens, ref_mel=None, mel_lens=None, target_dur=None, target_f0=None, style_dropout_p=0.5, return_audio=False):
         """
         text_tokens: [B, T_text]
         text_lens:   [B] (actual token lengths)
         ref_mel:     [B, 80, T_mel] (optional during inference)
         mel_lens:    [B] (actual mel frame lengths)
         target_dur:  [B, T_text] (explicit durations, if provided)
+        target_f0:   [B, T_mel, 1] (ground truth continuous F0 pitch, if provided)
 
         Returns:
             audio:            [B, T_audio] or None
@@ -130,6 +168,7 @@ class TamilTTS(nn.Module):
             align_dur:        [B, T_text] (alignment-derived duration targets)
             forward_sum_loss: scalar tensor (from RAD-TTS aligner)
             bin_loss:         scalar tensor (from RAD-TTS aligner)
+            f0_pred:          [B, mel_len, 1] (predicted continuous log-F0 pitch)
         """
         B, T_text = text_tokens.shape
         device = text_tokens.device
@@ -180,18 +219,21 @@ class TamilTTS(nn.Module):
         # 5. Length Regulation
         x_expanded = length_regulate(x, durations, max_len=mel_len)  # [B, mel_len, 512]
 
-        # 6. Modulate prosody & style
-        latents = self.diffusion_prosody(x_expanded, style)          # [B, mel_len, 512]
+        # 6. Pitch Conditioning (FastPitch / StyleTTS 2 Standard)
+        x_acoustic, f0_pred = self.pitch_predictor(x_expanded, f0_target=target_f0)
 
-        # 7. Predict Coarse & Refined 80-channel Mel Spectrogram (22.05 kHz)
+        # 7. Modulate prosody & style
+        latents = self.diffusion_prosody(x_acoustic, style)          # [B, mel_len, 512]
+
+        # 8. Predict Coarse & Refined 80-channel Mel Spectrogram (22.05 kHz)
         mel_coarse = self.acoustic_proj(latents)                     # [B, mel_len, 80]
         mel_residual = self.postnet(mel_coarse)                      # [B, mel_len, 80]
         mel_refined = mel_coarse + mel_residual                      # [B, mel_len, 80]
 
-        # 8. Synthesize waveform via Vocoder ONLY when required (inference/eval/SLM)
+        # 9. Synthesize waveform via Vocoder ONLY when required (inference/eval/SLM)
         if return_audio or not self.training:
             audio = self.vocoder(mel_refined)                        # [B, T_audio]
         else:
             audio = None
 
-        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, forward_sum_loss, bin_loss
+        return audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, forward_sum_loss, bin_loss, f0_pred

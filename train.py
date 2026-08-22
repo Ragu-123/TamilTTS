@@ -296,7 +296,7 @@ def train_worker(local_rank, world_size, cfg):
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
                 with sync_context:
                     need_audio = (slm_loss_fn is not None and cfg.weight_slm > 0.0)
-                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, fwd_loss, bin_loss = model(
+                    gen_audio, mel_refined, mel_coarse, dur_pred, log_dur_pred, align_dur, fwd_loss, bin_loss, pred_f0 = model(
                         text_tokens, text_lens,
                         ref_mel=ref_mel,
                         mel_lens=mel_lens,
