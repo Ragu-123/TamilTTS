@@ -1,7 +1,7 @@
 """
 IndicMFA Alignment & Duration Extraction Module
 """
-import os, glob, time, shutil, subprocess, textgrid, torch
+import os, glob, time, shutil, subprocess, torch
 from concurrent.futures import ThreadPoolExecutor
 
 def run_mfa_alignment(corpus_dir, dict_path, model_path, output_dir, mfa_bin="mfa", jobs=4):
@@ -46,6 +46,7 @@ def run_mfa_alignment(corpus_dir, dict_path, model_path, output_dir, mfa_bin="mf
 
 def parse_single_textgrid(tg_p, hop_length=256, sample_rate=22050):
     try:
+        import textgrid
         tg = textgrid.TextGrid.fromFile(tg_p)
         key = os.path.splitext(os.path.basename(tg_p))[0]
         phones_tier = [t for t in tg.tiers if t.name.lower() in ["phones", "phone", "phonemes", "phoneme", "graphemes", "grapheme"]]
