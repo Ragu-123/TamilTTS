@@ -161,15 +161,16 @@ class TamilTTS(nn.Module):
         forward_sum_loss = torch.tensor(0.0, device=device)
         bin_loss = torch.tensor(0.0, device=device)
 
-        if self.training and ref_mel is not None and mel_lens is not None:
-            # Exact RAD-TTS Alignment Network (Forward-Sum + True Binarization on same log_A)
+        if target_dur is not None:
+            # Kokoro-style direct ground-truth duration supervision
+            align_dur = target_dur
+            durations = target_dur
+            mel_len = int(mel_lens.max().item()) if mel_lens is not None else max(int(durations.sum(dim=1).max().item()), 16)
+        elif self.training and ref_mel is not None and mel_lens is not None:
+            # RAD-TTS Alignment Network (Forward-Sum + True Binarization on same log_A)
             align_dur, hard_path, forward_sum_loss, bin_loss = self.aligner(x, ref_mel, text_lens, mel_lens)
             durations = align_dur
             mel_len = int(mel_lens.max().item())
-        elif target_dur is not None:
-            align_dur = target_dur
-            durations = target_dur
-            mel_len = int(durations.sum(dim=1).max().item())
         else:
             align_dur = dur_pred
             dur_rounded = torch.clamp(torch.round(dur_pred), min=1.0) * (~text_mask).float()

@@ -24,6 +24,10 @@ class DurationPredictor(nn.Module):
         self.drop2 = nn.Dropout(dropout)
 
         self.proj = nn.Linear(filter_channels, 1)
+        # Initialize bias to ln(5.0) ~ 1.6 so untrained/default output is ~5 frames/char (~60ms),
+        # guaranteeing natural 2.5-3.5s speech instead of 0.39s insect buzzing
+        nn.init.constant_(self.proj.bias, 1.6)
+        nn.init.zeros_(self.proj.weight)
 
     def forward(self, x, mask=None):
         """

@@ -50,8 +50,9 @@ class Config:
     # --- Loss Weights (Staged & Warmed-up Training) ---
     weight_mel_refined = 1.0     # PostNet refined mel loss (Masked L1)
     weight_mel_coarse  = 0.5     # Pre-PostNet coarse mel loss (Masked L1)
-    weight_dur         = 0.1     # Duration MSE loss on alignment-derived durations
+    weight_dur         = 1.0     # Duration MSE loss (1.0 for robust duration learning)
     weight_align       = 1.0     # Exact RAD-TTS Forward-Sum Loss
     weight_bin         = 1.0     # Exact RAD-TTS Binarization Loss target
     bin_warmup_steps   = 5_000   # Binarization loss warmup (0.0 -> 1.0 over 5k steps)
     weight_slm         = 0.0     # Stage 1: 0.0 (Stage 2 after step 10k: 0.1)
+    use_gt_durations   = True    # Kokoro-style ground-truth duration supervision

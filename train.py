@@ -273,6 +273,16 @@ def train_worker(local_rank, world_size, cfg):
                 mel_lens    = mel_lens.to(device)
                 real_audio  = real_audio.to(device)
 
+                # Build proportional ground-truth duration targets (Kokoro-style bootstrap)
+                target_dur = None
+                if getattr(cfg, "use_gt_durations", True):
+                    target_dur = torch.zeros_like(text_tokens, dtype=torch.float32)
+                    for b_i in range(text_tokens.size(0)):
+                        t_len = max(int(text_lens[b_i].item()), 1)
+                        m_len = max(int(mel_lens[b_i].item()), 1)
+                        base_d = m_len / t_len
+                        target_dur[b_i, :t_len] = base_d
+
                 is_accumulating = is_distributed and ((batch_idx + 1) % cfg.grad_accum_steps != 0)
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
                 with sync_context:
@@ -281,6 +291,7 @@ def train_worker(local_rank, world_size, cfg):
                         text_tokens, text_lens,
                         ref_mel=ref_mel,
                         mel_lens=mel_lens,
+                        target_dur=target_dur,
                         return_audio=need_audio,
                     )
 
