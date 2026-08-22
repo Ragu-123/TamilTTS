@@ -50,9 +50,9 @@ def text_to_ids(text, char2id, max_vocab_size=384):
 
 
 def compute_mel_from_audio(audio_path, target_sr=22050, n_fft=1024, hop_length=256, n_mels=80):
-    """Computes magnitude natural log-mel spectrogram matching 22.05kHz HiFi-GAN scale."""
-    import torchaudio.transforms as T
+    """Computes symmetric dB mel spectrogram matching 22.05kHz IndicTTS / HiFi-GAN scale [-4.0, +4.0]."""
     import torchaudio.functional as AF
+    from data.dataset import IndicTTSMelProcessor
     data, orig_sr = sf.read(audio_path)
     audio_t = torch.tensor(data, dtype=torch.float32)
     if audio_t.ndim > 1:
@@ -60,21 +60,11 @@ def compute_mel_from_audio(audio_path, target_sr=22050, n_fft=1024, hop_length=2
     if orig_sr != target_sr:
         audio_t = AF.resample(audio_t, orig_sr, target_sr)
 
-    mel_transform = T.MelSpectrogram(
-        sample_rate=target_sr,
-        n_fft=n_fft,
-        win_length=n_fft,
-        hop_length=hop_length,
-        f_min=0.0,
-        f_max=8000.0,
-        n_mels=n_mels,
-        power=1.0,
-        norm="slaney",
-        mel_scale="slaney",
-    )
-    mel = mel_transform(audio_t)
-    mel_log = torch.log(torch.clamp(mel, min=1e-5)).numpy()
-    return mel_log, len(audio_t) / target_sr
+    mel_proc = IndicTTSMelProcessor(sample_rate=target_sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+    mel = mel_proc(audio_t)
+    if mel.dim() == 3:
+        mel = mel.squeeze(0)
+    return mel.numpy(), len(audio_t) / target_sr
 
 
 @torch.no_grad()
@@ -90,9 +80,9 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None, speed
     tokens = torch.tensor([ids], dtype=torch.long, device=device)
     text_mask = torch.zeros(1, len(ids), dtype=torch.bool, device=device)
 
-    # Reference mel for voice style
+    # Reference mel for voice style (matches IndicTTSMelProcessor silence floor -4.0)
     if ref_mel is None:
-        ref_mel = torch.full((1, 80, 100), -3.5, device=device)
+        ref_mel = torch.full((1, 80, 100), -4.0, device=device)
     elif ref_mel.dim() == 2:
         ref_mel = ref_mel.unsqueeze(0)
     ref_mel = ref_mel.to(device)
@@ -101,15 +91,14 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None, speed
     eval_model.eval()
 
     # Step A: Text encoding with Positional Encodings
-    style = eval_model.style_encoder(ref_mel)
     x = eval_model.text_encoder(tokens, mask=text_mask)
 
     # Step B: Pure learned duration prediction
     dur_pred, _ = eval_model.duration_predictor(x, mask=text_mask)  # [1, T_text]
 
-    # Apply speed scaling (1.0 = normal, 0.85 = slower/clearer, 1.2 = faster)
+    # Apply speed scaling and enforce minimum phoneme duration floor (min 3 frames = 35ms)
     dur_scaled = dur_pred * (1.0 / max(speed, 0.1))
-    dur_rounded = torch.clamp(torch.round(dur_scaled), min=1.0)
+    dur_rounded = torch.clamp(torch.round(dur_scaled), min=3.0)
     total_frames = int(dur_rounded.sum().item())
     total_frames = max(total_frames, 16)
 
@@ -118,6 +107,7 @@ def synthesize(model, text, char2id, device, vocab_size=256, ref_mel=None, speed
         tokens, text_lens,
         ref_mel=ref_mel,
         target_dur=dur_rounded,
+        return_audio=True
     )
 
     # Vocoder waveform synthesis

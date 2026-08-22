@@ -337,7 +337,7 @@ def train_worker(local_rank, world_size, cfg):
                         loss_slm = slm_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
 
                     total_loss = (
-                        45.0 * loss_mel
+                        loss_mel
                         + cfg.weight_dur * loss_dur
                         + cfg.weight_align * loss_align
                         + cfg.weight_slm * loss_slm

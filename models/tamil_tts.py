@@ -179,7 +179,7 @@ class TamilTTS(nn.Module):
         default_style_exp = self.default_style.expand(B, -1)
         if ref_mel is not None:
             # Detach ref_mel when extracting style to prevent backprop gradient shortcuts
-            style_extracted = self.style_encoder(ref_mel.detach())
+            style_extracted = self.style_encoder(ref_mel.detach(), mel_lens=mel_lens)
             if self.training and style_dropout_p > 0.0:
                 # 50% style dropout: forces TextEncoder to learn prosody independently
                 drop_mask = (torch.rand(B, 1, device=device) < style_dropout_p).float()

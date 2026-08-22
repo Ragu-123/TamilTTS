@@ -335,7 +335,7 @@ def tamil_tts_collate_fn(batch):
     max_audio_len = int(audio_lens.max().item())
 
     padded_tokens = torch.zeros(B, max_text_len, dtype=torch.long)
-    padded_mel = torch.full((B, 80, max_mel_len), -11.5, dtype=torch.float32)
+    padded_mel = torch.full((B, 80, max_mel_len), -4.0, dtype=torch.float32)
     padded_audio = torch.zeros(B, max_audio_len, dtype=torch.float32)
     padded_dur = torch.zeros(B, max_text_len, dtype=torch.long)
 
