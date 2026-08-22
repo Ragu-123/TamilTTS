@@ -217,7 +217,7 @@ def train_worker(local_rank, world_size, cfg):
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
-        prefetch_factor=2 if use_workers else None,
+        prefetch_factor=3 if use_workers else None,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -229,7 +229,7 @@ def train_worker(local_rank, world_size, cfg):
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
-        prefetch_factor=2 if use_workers else None,
+        prefetch_factor=3 if use_workers else None,
         drop_last=False,
     )
 
