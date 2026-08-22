@@ -89,13 +89,18 @@ class DirectParquetTamilDataset(Dataset):
         self.durations_dict = None
         durations_file = getattr(cfg, "durations_file", None)
         valid_keys = None
-        if durations_file and os.path.exists(durations_file):
+        if durations_file:
+            if not os.path.exists(durations_file):
+                raise FileNotFoundError(
+                    f"❌ FATAL ERROR: Configured durations_file '{durations_file}' not found on disk! "
+                    f"Please check your dataset mount path or generate durations with preprocess.py."
+                )
             try:
                 self.durations_dict = torch.load(durations_file, map_location="cpu")
                 valid_keys = set(self.durations_dict.keys())
                 print(f"  ✓ Loaded {len(self.durations_dict):,} ground-truth MFA durations from '{durations_file}'")
             except Exception as e:
-                print(f"  ⚠️ Warning: Could not load durations file '{durations_file}': {e}")
+                raise RuntimeError(f"❌ FATAL ERROR: Failed to load durations file '{durations_file}': {e}")
 
         # Build lightweight row group index — STRICTLY FILTERED to aligned samples (0 unaligned / 0 fallbacks)
         self.index = []
@@ -113,7 +118,12 @@ class DirectParquetTamilDataset(Dataset):
                 print(f"    ⚠️ Warning: Could not read metadata from {f}: {e}")
 
         if valid_keys is not None:
-            print(f"  ✓ Strict MFA Filtering: Training on {len(self.index):,} verified aligned samples (100% ground-truth durations).")
+            if len(self.index) == 0:
+                raise RuntimeError(
+                    f"❌ FATAL ERROR: Zero dataset samples matched the keys in '{durations_file}'! "
+                    f"Please verify parquet files and durations file match."
+                )
+            print(f"  ✓ Strict MFA Filtering: Training on {len(self.index):,} verified aligned samples (100% ground-truth durations, 0 fallbacks).")
 
         # Worker-local single row-group cache
         self._cached_key = None
@@ -263,9 +273,9 @@ class DirectParquetTamilDataset(Dataset):
                     dur_sum = gt_dur.sum().item()
                     diff = mel_len - dur_sum
                     if abs(diff) <= max(10, int(0.05 * mel_len)):
-                        # Adjust boundary interval so sum(durations) matches mel_len frame-for-frame
-                        max_idx = torch.argmax(gt_dur).item()
-                        gt_dur[max_idx] = max(1, gt_dur[max_idx].item() + diff)
+                        # Adjust boundary silence interval (preserving all interior phonemes untouched)
+                        target_idx = -1 if gt_dur[-1] >= gt_dur[0] else 0
+                        gt_dur[target_idx] = max(1, gt_dur[target_idx].item() + diff)
                     else:
                         # Large discrepancy (>5% length mismatch) -> discard sample
                         continue
