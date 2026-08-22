@@ -135,8 +135,10 @@ def main():
     elapsed = time.time() - start_time
     print(f"\n🎉 500-step overfit finished in {elapsed:.1f}s!")
 
-    # 6. Evaluation & Synthesis of Overfit Samples
-    print("\nSynthesizing test audios using predicted durations (Inference Mode)...")
+    # 6. Dual-Mode Evaluation & Audio Synthesis
+    print("\n" + "=" * 65)
+    print("  Synthesizing Test Audio (Evaluating Acoustic Model & Duration Predictor)")
+    print("=" * 65)
     model.eval()
     with torch.no_grad():
         for i in range(min(5, len(dataset))):
@@ -144,15 +146,32 @@ def main():
             toks, t_len, _, m_len, _, _, true_dur = sample
             toks_t = toks.unsqueeze(0).to(device)
             t_len_t = torch.tensor([t_len], dtype=torch.long, device=device)
+            true_dur_t = true_dur.unsqueeze(0).to(device).float()
 
-            # Synthesize waveform via model inference (using duration predictor)
-            audio, mel_refined, _, dur_pred, _, _, _, _ = model(toks_t, t_len_t, return_audio=True)
-            wav = audio.squeeze().cpu().numpy()
-            wav_path = os.path.join(output_dir, f"overfit_sample_{i+1}.wav")
-            sf.write(wav_path, wav, cfg.sample_rate)
+            # Test A: Pure Acoustic Network Synthesis (Using Original Ground-Truth MFA Durations)
+            audio_mfa, mel_mfa, _, _, _, _, _, _ = model(
+                toks_t, t_len_t,
+                target_dur=true_dur_t,
+                return_audio=True
+            )
+            wav_mfa = audio_mfa.squeeze().cpu().numpy()
+            mfa_path = os.path.join(output_dir, f"sample_{i+1}_mfa_durations.wav")
+            sf.write(mfa_path, wav_mfa, cfg.sample_rate)
 
-            # Duration stats
-            print(f"  • Sample {i+1}: {len(wav)/cfg.sample_rate:.2f}s audio saved to {wav_path}")
+            # Test B: Duration Predictor Inference Mode (Using Model-Predicted Durations)
+            audio_pred, mel_pred, _, dur_pred, _, _, _, _ = model(
+                toks_t, t_len_t,
+                return_audio=True
+            )
+            wav_pred = audio_pred.squeeze().cpu().numpy()
+            pred_path = os.path.join(output_dir, f"sample_{i+1}_predicted_durations.wav")
+            sf.write(pred_path, wav_pred, cfg.sample_rate)
+
+            dur_mfa_sec = len(wav_mfa) / cfg.sample_rate
+            dur_pred_sec = len(wav_pred) / cfg.sample_rate
+            print(f"\n[Sample {i+1}] Graphemes: {t_len}")
+            print(f"  🔊 Test A (MFA Durations)      : {dur_mfa_sec:.2f}s audio -> {mfa_path}")
+            print(f"  🤖 Test B (Predicted Durations): {dur_pred_sec:.2f}s audio -> {pred_path}")
 
     print(f"\n✅ All sample WAVs saved to '{output_dir}'.")
 

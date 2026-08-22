@@ -33,9 +33,9 @@ class PostNet(nn.Module):
                     kernel_size=kernel_size,
                     stride=1,
                     padding=(kernel_size - 1) // 2,
-                    bias=False
+                    bias=True
                 ),
-                nn.BatchNorm1d(postnet_dim),
+                nn.GroupNorm(1, postnet_dim),
                 nn.Tanh(),
                 nn.Dropout(dropout)
             )
@@ -50,9 +50,9 @@ class PostNet(nn.Module):
                         kernel_size=kernel_size,
                         stride=1,
                         padding=(kernel_size - 1) // 2,
-                        bias=False
+                        bias=True
                     ),
-                    nn.BatchNorm1d(postnet_dim),
+                    nn.GroupNorm(1, postnet_dim),
                     nn.Tanh(),
                     nn.Dropout(dropout)
                 )
@@ -66,9 +66,8 @@ class PostNet(nn.Module):
                     kernel_size=kernel_size,
                     stride=1,
                     padding=(kernel_size - 1) // 2,
-                    bias=False
+                    bias=True
                 ),
-                nn.BatchNorm1d(mel_dim),
                 nn.Dropout(dropout)
             )
         )
