@@ -101,7 +101,7 @@ class TamilTTS(nn.Module):
             postnet_dim=512,
             n_layers=5,
             kernel_size=5,
-            dropout=0.5,
+            dropout=0.1,
         )
 
         # Mel initialization matching natural log-mel distributions (mean ~ -3.5)

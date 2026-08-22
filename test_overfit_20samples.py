@@ -68,19 +68,20 @@ def main():
     total_p, train_p = count_parameters(model)
     print(f"  Trainable Parameters: {train_p / 1e6:.2f}M\n")
 
-    # 4. Optimizer & Loss Functions
+    # 4. Optimizer & Loss Functions (Optimized for Rapid Overfit Convergence)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=3e-4, weight_decay=1e-4
+        lr=1e-3, weight_decay=1e-4
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2000, eta_min=1e-4)
     dual_mel_fn = DualMelLoss(coarse_weight=cfg.weight_mel_coarse, refined_weight=cfg.weight_mel_refined)
     dur_loss_fn = LogDurationLoss()
 
     output_dir = "./overfit_audio_outputs"
     os.makedirs(output_dir, exist_ok=True)
 
-    # 5. Overfit Loop (500 steps)
-    total_steps = 500
+    # 5. Overfit Loop (2,000 steps for deep convergence)
+    total_steps = 2000
     step = 0
     start_time = time.time()
     pbar = tqdm(total=total_steps, desc="Overfitting 20 Samples", ncols=110)
@@ -117,8 +118,9 @@ def main():
 
             total_loss = 45.0 * loss_mel + cfg.weight_dur * loss_dur
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
+            scheduler.step()
 
             step += 1
             pbar.update(1)
