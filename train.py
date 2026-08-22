@@ -80,45 +80,45 @@ def auto_configure_hardware(cfg):
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, srfd_loss_fn, device, local_rank=0):
+def evaluate(model, val_loader, device, local_rank=0):
     eval_model = model.module if hasattr(model, "module") else model
     eval_model.eval()
     dual_mel_fn = DualMelLoss(coarse_weight=0.5, refined_weight=1.0)
 
     total_mel_loss = 0.0
-    total_srfd = 0.0
     count = 0
 
     pbar = tqdm(val_loader, desc="Validating", unit="batch", ncols=120, disable=not is_main_process(local_rank))
     for batch in pbar:
         if batch is None:
             continue
-        text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch[:6]
+        text_tokens, text_lens, ref_mel, mel_lens = batch[0], batch[1], batch[2], batch[3]
+        target_dur = batch[6].to(device).float() if len(batch) >= 7 and batch[6] is not None else None
+
         text_tokens = text_tokens.to(device)
         text_lens   = text_lens.to(device)
         ref_mel     = ref_mel.to(device)
         mel_lens    = mel_lens.to(device)
-        real_audio  = real_audio.to(device)
 
         with torch.no_grad():
-            gen_audio, mel_refined, mel_coarse, _, _, _, _, _ = eval_model(
-                text_tokens, text_lens, ref_mel=ref_mel, mel_lens=mel_lens
+            _, mel_refined, mel_coarse, _, _, _, _, _, _ = eval_model(
+                text_tokens, text_lens,
+                ref_mel=ref_mel,
+                mel_lens=mel_lens,
+                target_dur=target_dur,
+                return_audio=False
             )
             mel_target = ref_mel.transpose(1, 2)
             loss_mel, _, _ = dual_mel_fn(mel_refined, mel_coarse, mel_target, mel_lens=mel_lens)
 
-            min_a = min(gen_audio.size(1), real_audio.size(1))
-            srfd = srfd_loss_fn(real_audio[:, :min_a], gen_audio[:, :min_a])
-
         total_mel_loss += loss_mel.item()
-        total_srfd += srfd.item()
         count += 1
 
         if is_main_process(local_rank):
-            pbar.set_postfix({"mel": f"{loss_mel.item():.4f}", "srfd": f"{srfd.item():.4f}"})
+            pbar.set_postfix({"mel": f"{loss_mel.item():.4f}"})
 
     eval_model.train()
-    return total_mel_loss / max(count, 1), total_srfd / max(count, 1)
+    return total_mel_loss / max(count, 1)
 
 
 def train_worker(local_rank, world_size, cfg):
@@ -177,13 +177,7 @@ def train_worker(local_rank, world_size, cfg):
     log_dur_loss_fn  = LogDurationLoss()
     pitch_loss_fn    = PitchLoss()
 
-    log(f"  Loading IndicWhisper: {cfg.whisper_dir}", local_rank)
-    whisper_model = WhisperModel.from_pretrained(cfg.whisper_dir, low_cpu_mem_usage=True)
-    whisper_enc = whisper_model.encoder.to(device)
-    whisper_ext = WhisperFeatureExtractor.from_pretrained(cfg.whisper_dir)
-    srfd_loss_fn = SRFDLoss(whisper_enc, whisper_ext, sample_rate=cfg.sample_rate)
-    del whisper_model
-    gc.collect()
+    # 4. Dataset & Dynamic Loaders
 
     slm_loss_fn = None
     if cfg.weight_slm > 0.0:
@@ -361,32 +355,32 @@ def train_worker(local_rank, world_size, cfg):
                         })
 
                     # Checkpoint validation
-                    if global_step % cfg.save_every == 0 and is_main_process(local_rank):
-                        val_mel, val_srfd = evaluate(model, val_loader, srfd_loss_fn, device, local_rank)
-                        log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
-
-                        save_checkpoint(
-                            os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"),
-                            model, optimizer, scheduler, global_step, val_mel
-                        )
-                        save_checkpoint(
-                            os.path.join(cfg.checkpoint_dir, "latest.pt"),
-                            model, optimizer, scheduler, global_step, val_mel
-                        )
-
-                        if val_mel < best_val_loss:
-                            best_val_loss = val_mel
+                    if global_step % cfg.save_every == 0:
+                        val_mel = evaluate(model, val_loader, device, local_rank)
+                        if is_main_process(local_rank):
+                            log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f}")
                             save_checkpoint(
-                                os.path.join(cfg.checkpoint_dir, "best.pt"),
+                                os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"),
                                 model, optimizer, scheduler, global_step, val_mel
                             )
-                            log(f"  🏆 New Best Model Saved (Mel Loss: {best_val_loss:.4f})")
+                            save_checkpoint(
+                                os.path.join(cfg.checkpoint_dir, "latest.pt"),
+                                model, optimizer, scheduler, global_step, val_mel
+                            )
+                            if val_mel < best_val_loss:
+                                best_val_loss = val_mel
+                                save_checkpoint(
+                                    os.path.join(cfg.checkpoint_dir, "best.pt"),
+                                    model, optimizer, scheduler, global_step, val_mel
+                                )
+                                log(f"  🏆 New Best Model Saved (Mel Loss: {best_val_loss:.4f})")
+                        if is_distributed:
+                            dist.barrier()
 
             # End-of-Epoch Evaluation
+            val_mel = evaluate(model, val_loader, device, local_rank)
             if is_main_process(local_rank):
-                val_mel, val_srfd = evaluate(model, val_loader, srfd_loss_fn, device, local_rank)
-                log(f"\nEpoch {epoch+1} Complete | Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
-
+                log(f"\nEpoch {epoch+1} Complete | Val Mel Loss: {val_mel:.4f}")
                 save_checkpoint(
                     os.path.join(cfg.checkpoint_dir, "latest.pt"),
                     model, optimizer, scheduler, global_step, val_mel
@@ -397,6 +391,8 @@ def train_worker(local_rank, world_size, cfg):
                         os.path.join(cfg.checkpoint_dir, "best.pt"),
                         model, optimizer, scheduler, global_step, val_mel
                     )
+            if is_distributed:
+                dist.barrier()
 
     finally:
         if is_distributed and dist.is_initialized():
