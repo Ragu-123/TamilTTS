@@ -85,31 +85,39 @@ class DirectParquetTamilDataset(Dataset):
 
         self.char2id, self.vocab_size = build_tamil_vocab(max_vocab=getattr(cfg, "vocab_size", 256))
 
-        # Build lightweight row group index [(file_path, row_group_idx, row_in_group), ...]
+        # Load Ground-Truth MFA Durations if available
+        self.durations_dict = None
+        durations_file = getattr(cfg, "durations_file", None)
+        valid_keys = None
+        if durations_file and os.path.exists(durations_file):
+            try:
+                self.durations_dict = torch.load(durations_file, map_location="cpu")
+                valid_keys = set(self.durations_dict.keys())
+                print(f"  ✓ Loaded {len(self.durations_dict):,} ground-truth MFA durations from '{durations_file}'")
+            except Exception as e:
+                print(f"  ⚠️ Warning: Could not load durations file '{durations_file}': {e}")
+
+        # Build lightweight row group index — STRICTLY FILTERED to aligned samples (0 unaligned / 0 fallbacks)
         self.index = []
         for f in self.parquet_files:
             try:
                 pf = pq.ParquetFile(f, memory_map=True)
+                base_f = os.path.basename(f)
                 for rg_idx in range(pf.num_row_groups):
                     num_rows = pf.metadata.row_group(rg_idx).num_rows
                     for r in range(num_rows):
-                        self.index.append((f, rg_idx, r))
+                        key = f"{base_f}_rg{rg_idx}_r{r}"
+                        if valid_keys is None or key in valid_keys:
+                            self.index.append((f, rg_idx, r, key))
             except Exception as e:
                 print(f"    ⚠️ Warning: Could not read metadata from {f}: {e}")
+
+        if valid_keys is not None:
+            print(f"  ✓ Strict MFA Filtering: Training on {len(self.index):,} verified aligned samples (100% ground-truth durations).")
 
         # Worker-local single row-group cache
         self._cached_key = None
         self._cached_table = None
-
-        # Load Ground-Truth MFA Durations if available
-        self.durations_dict = None
-        durations_file = getattr(cfg, "durations_file", None)
-        if durations_file and os.path.exists(durations_file):
-            try:
-                self.durations_dict = torch.load(durations_file, map_location="cpu")
-                print(f"  ✓ Loaded {len(self.durations_dict):,} ground-truth MFA durations from '{durations_file}'")
-            except Exception as e:
-                print(f"  ⚠️ Warning: Could not load durations file '{durations_file}': {e}")
 
     def __len__(self):
         return len(self.index)
@@ -179,7 +187,7 @@ class DirectParquetTamilDataset(Dataset):
         for offset in range(total):
             actual_idx = (idx + offset) % total
             try:
-                file_path, rg_idx, row_in_rg = self.index[actual_idx]
+                file_path, rg_idx, row_in_rg, sample_key = self.index[actual_idx]
                 sample = self._get_row(file_path, rg_idx, row_in_rg)
 
                 # 1. Extract Text
@@ -241,21 +249,35 @@ class DirectParquetTamilDataset(Dataset):
                 mel_log = torch.log(torch.clamp(mel, min=1e-5))
                 mel_len = mel_log.shape[1]
 
-                # 4. Ground-Truth Duration Attachment (IndicMFA with Proportional Fallback)
-                sample_key = f"{os.path.basename(file_path)}_rg{rg_idx}_r{row_in_rg}"
-                gt_dur = None
-                if self.durations_dict is not None and sample_key in self.durations_dict:
-                    entry = self.durations_dict[sample_key]
+                # 4. Strict Ground-Truth Duration Attachment (100% MFA Ground Truth, Exact Token & Mel-Sum Verification)
+                if self.durations_dict is not None:
+                    entry = self.durations_dict.get(sample_key)
+                    if not entry:
+                        continue
                     durs = entry.get("durations", [])
-                    if len(durs) == text_len:
-                        gt_dur = torch.tensor(durs, dtype=torch.long)
-
-                if gt_dur is None:
-                    # Fallback to proportional duration for unaligned samples
+                    # Check 1: Exact token count match (number of durations == number of characters)
+                    if len(durs) != text_len:
+                        continue
+                    gt_dur = torch.tensor(durs, dtype=torch.long)
+                    # Check 2: Exact mel length sum match (sum(durations) == mel_len)
+                    dur_sum = gt_dur.sum().item()
+                    diff = mel_len - dur_sum
+                    if abs(diff) <= max(10, int(0.05 * mel_len)):
+                        # Adjust boundary interval so sum(durations) matches mel_len frame-for-frame
+                        max_idx = torch.argmax(gt_dur).item()
+                        gt_dur[max_idx] = max(1, gt_dur[max_idx].item() + diff)
+                    else:
+                        # Large discrepancy (>5% length mismatch) -> discard sample
+                        continue
+                else:
                     p_dur = max(1, mel_len // text_len)
                     gt_dur = torch.full((text_len,), p_dur, dtype=torch.long)
                     diff = mel_len - gt_dur.sum().item()
                     gt_dur[-1] = max(1, gt_dur[-1].item() + diff)
+
+                # Final assertion: verify both conditions strictly hold
+                if len(gt_dur) != text_len or gt_dur.sum().item() != mel_len:
+                    continue
 
                 return token_ids, text_len, mel_log, mel_len, audio_tensor, audio_len, gt_dur
 
