@@ -41,9 +41,10 @@ class Config:
 
     # --- Training Parameters ---
     total_steps      = 100_000
-    per_gpu_batch    = 32       # 32 samples per GPU (~12-13GB VRAM on L4)
-    grad_accum_steps = 1        # Instant 1-step updates across 4 GPUs (Effective batch = 128)
-    num_workers      = 4        # 4 workers per GPU = 16 CPU workers (Safe low RAM footprint ~35GB)
+    per_gpu_batch    = 16       # 16 samples per GPU (Effective batch = 64, maximum CPU/GPU throughput)
+    grad_accum_steps = 1        # Instant 1-step updates across 4 GPUs
+    num_workers      = 8        # 8 workers per GPU = 32 parallel CPU worker threads across 48 cores
+    prefetch_factor  = 4        # Workers buffer batches in RAM to eliminate GPU starvation
     learning_rate    = 1.5e-4   # FastPitch / StyleTTS2 standard LR
     warmup_steps     = 2_000
     save_every       = 2_000
