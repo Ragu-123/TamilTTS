@@ -66,7 +66,7 @@ def gate3_gradient_flow(model, batch, device):
         mel=batch["mel"], mel_lens=batch["mel_lens"],
         gt_dur=batch["gt_dur"], gt_logf0=batch["log_f0"], voiced=batch["voiced"],
         gt_energy=batch["energy"],
-        ref_mel=ref_mel, style_dropout=0.0, return_audio=False,
+        ref_mel=ref_mel, style_dropout=0.5, return_audio=False,  # exercise default_style path too
     )
     mel_fn = MelLoss(coarse_w=0.5, refined_w=1.0)
     dur_fn = DurationLoss()

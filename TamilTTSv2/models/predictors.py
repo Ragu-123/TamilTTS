@@ -47,11 +47,13 @@ class VariancePredictor(nn.Module):
 class DurationHead(VariancePredictor):
     """
     Duration predictor with log-mean init: final Linear bias=log(5),
-    weight zeros (so initial predicted durations ~= exp(log 5) = 5 frames).
+    weight small-random (initial predicted durations ~= exp(log 5) = 5 frames,
+    while keeping the gradient path to the conv stack alive on first backward;
+    exact zero weight init would zero out all upstream gradients).
     """
     def __init__(self, hidden_dim, filter_channels, kernel_size=3, dropout=0.1):
         super().__init__(hidden_dim, filter_channels, kernel_size=kernel_size, dropout=dropout)
-        nn.init.zeros_(self.proj.weight)
+        nn.init.normal_(self.proj.weight, std=0.02)
         with torch.no_grad():
             self.proj.bias.fill_(math.log(5.0))
 
