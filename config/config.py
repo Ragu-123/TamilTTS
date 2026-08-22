@@ -18,7 +18,7 @@ class Config:
     vocoder_config = "/kaggle/input/notebooks/sanjaynn/tamiltts-vocoder/indic_tts_tamil_clean/hifigan_config.json"
 
     # --- Model Architecture ---
-    vocab_size               = 256      # Covers all Tamil Unicode (0x0B80-0x0BFF) + digits + punctuation
+    vocab_size               = 384      # Covers all 273 Tamil G2G akshara units + sil + special tokens
     hidden_dim               = 512
     text_encoder_layers      = 10
     text_encoder_heads       = 8

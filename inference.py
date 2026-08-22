@@ -36,28 +36,16 @@ def normalize_tamil_text(text):
     return text
 
 
-def build_char2id(max_vocab_size=256):
-    char2id = {" ": 1}
-    idx = 2
-    for c in range(0x0B80, 0x0C00):
-        if idx < max_vocab_size:
-            char2id[chr(c)] = idx
-            idx += 1
-    for d in "0123456789":
-        if idx < max_vocab_size:
-            char2id[d] = idx
-            idx += 1
-    for p in list(".,!?;:-'\"()"):
-        if idx < max_vocab_size:
-            char2id[p] = idx
-            idx += 1
-    return char2id
+from data.dataset import build_tamil_vocab, TAMIL_G2G_TOKENS
+from preprocess.g2g import segment_tamil_g2g
 
 
-def text_to_ids(text, char2id, max_vocab_size=256):
+def text_to_ids(text, char2id, max_vocab_size=384):
     text = normalize_tamil_text(text)
-    ids = [char2id.get(ch, 0) for ch in text]
-    ids = [min(i, max_vocab_size - 1) for i in ids if i > 0]
+    g2g_set = set(TAMIL_G2G_TOKENS)
+    segmented = segment_tamil_g2g(text, g2g_set)
+    tokens = segmented.split()
+    ids = [char2id.get(t, 2) for t in tokens]
     return ids
 
 
@@ -184,9 +172,7 @@ def main():
     model = TamilTTS(cfg).to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
-    print(f"  Loaded from: Step {ckpt.get('step', 0)}, Loss {ckpt.get('loss', 0.0):.4f}")
-
-    char2id = build_char2id(max_vocab_size=ckpt_vocab_size)
+    char2id, _ = build_tamil_vocab(max_vocab=ckpt_vocab_size)
 
     # 3. Load speaker reference voice
     ref_mel = None

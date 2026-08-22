@@ -146,7 +146,7 @@ def main():
             t_len_t = torch.tensor([t_len], dtype=torch.long, device=device)
 
             # Synthesize waveform via model inference (using duration predictor)
-            audio = model(toks_t, t_len_t, return_audio=True)
+            audio, mel_refined, _, dur_pred, _, _, _, _ = model(toks_t, t_len_t, return_audio=True)
             wav = audio.squeeze().cpu().numpy()
             wav_path = os.path.join(output_dir, f"overfit_sample_{i+1}.wav")
             sf.write(wav_path, wav, cfg.sample_rate)
