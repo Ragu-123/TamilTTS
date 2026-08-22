@@ -134,15 +134,16 @@ def train_worker(local_rank, world_size, cfg):
     if is_distributed:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
         if not dist.is_initialized():
             dist.init_process_group(
                 backend="nccl",
                 init_method="env://",
                 rank=local_rank,
-                world_size=world_size
+                world_size=world_size,
+                device_id=device
             )
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -217,7 +218,7 @@ def train_worker(local_rank, world_size, cfg):
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
-        prefetch_factor=3 if use_workers else None,
+        prefetch_factor=2 if use_workers else None,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -229,7 +230,7 @@ def train_worker(local_rank, world_size, cfg):
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
-        prefetch_factor=3 if use_workers else None,
+        prefetch_factor=2 if use_workers else None,
         drop_last=False,
     )
 
