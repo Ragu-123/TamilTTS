@@ -17,7 +17,7 @@ from .style_encoder import StyleEncoder
 from .duration_predictor import DurationPredictor
 from .diffusion import DiffusionProsody
 from .postnet import PostNet
-from .vocoder import FullVocoder
+from .vocoder import FullVocoder, load_pretrained_vocoder
 from .alignment import AlignmentNetwork
 
 
