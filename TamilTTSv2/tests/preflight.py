@@ -56,27 +56,36 @@ def fake_batch(cfg, B=2, Tt=14, Tm=48, device="cpu"):
     }
 
 
-def gate3_gradient_flow(model, batch, device):
-    print("\n" + "=" * 60)
-    print("GATE 3: Gradient Flow Audit (full regression objective)")
-    print("=" * 60)
-    ref_mel = torch.roll(batch["mel"], shifts=1, dims=0)      # exercise style_encoder
+def _forward_loss(model, batch, use_ref):
+    mel_fn = MelLoss(coarse_w=0.5, refined_w=1.0)
+    dur_fn = DurationLoss()
+    pe_fn = PitchEnergyLoss()
+    ref_mel = torch.roll(batch["mel"], shifts=1, dims=0) if use_ref else None
     out = model(
         batch["tokens"], batch["token_lens"],
         mel=batch["mel"], mel_lens=batch["mel_lens"],
         gt_dur=batch["gt_dur"], gt_logf0=batch["log_f0"], voiced=batch["voiced"],
         gt_energy=batch["energy"],
-        ref_mel=ref_mel, style_dropout=0.5, return_audio=False,  # exercise default_style path too
+        ref_mel=ref_mel, style_dropout=0.0, return_audio=False,
     )
-    mel_fn = MelLoss(coarse_w=0.5, refined_w=1.0)
-    dur_fn = DurationLoss()
-    pe_fn = PitchEnergyLoss()
     l_mel, _, _ = mel_fn(out["mel_pred"], out["mel_coarse"], batch["mel"], mel_lens=batch["mel_lens"])
     l_dur = dur_fn(out["log_dur"], batch["gt_dur"], token_lens=batch["token_lens"])
     l_f0, l_en = pe_fn(out["log_f0"], out["energy"], batch["log_f0"], batch["voiced"],
                        batch["energy"], mel_lens=batch["mel_lens"])
-    loss = l_mel + l_dur + l_f0 + l_en
-    loss.backward()
+    return l_mel + l_dur + l_f0 + l_en
+
+
+def gate3_gradient_flow(model, batch, device):
+    print("\n" + "=" * 60)
+    print("GATE 3: Gradient Flow Audit (full regression objective)")
+    print("=" * 60)
+    # Pass A exercises style_encoder (reference conditioning);
+    # Pass B exercises default_style (no reference). Gradients accumulate.
+    loss_a = _forward_loss(model, batch, use_ref=True)
+    loss_a.backward()
+    loss_b = _forward_loss(model, batch, use_ref=False)
+    loss_b.backward()
+    print(f"  pass A (ref-mel) loss={loss_a.item():.4f} | pass B (default style) loss={loss_b.item():.4f}")
 
     bad = []
     checked = 0
