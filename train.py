@@ -157,7 +157,7 @@ def train_worker(local_rank, world_size, cfg):
     log(f"  Trainable Parameters: {train_p / 1e6:.2f}M", local_rank)
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         log(f"  🔥 DDP Active       : {world_size} GPUs (Rank {local_rank} on cuda:{local_rank})", local_rank)
     else:
         log(f"  🚀 GPU Active       : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}", local_rank)
