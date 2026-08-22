@@ -49,7 +49,8 @@ def fake_batch(cfg, B=2, Tt=14, Tm=48, device="cpu"):
     energy = torch.randn(B, Tm, device=device)
     return {
         "tokens": tokens, "token_lens": token_lens,
-        "mel": None, "mel_lens": torch.tensor([Tm] * B, device=device),
+        "mel": torch.randn(B, 80, Tm, device=device) * 0.8 - 2.0,
+        "mel_lens": torch.tensor([Tm] * B, device=device),
         "audio": audio, "audio_lens": torch.tensor([Ta] * B, device=device),
         "gt_dur": gt_dur, "log_f0": log_f0, "voiced": voiced, "energy": energy,
     }
