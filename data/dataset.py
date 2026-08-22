@@ -101,6 +101,16 @@ class DirectParquetTamilDataset(Dataset):
         self._cached_key = None
         self._cached_table = None
 
+        # Load Ground-Truth MFA Durations if available
+        self.durations_dict = None
+        durations_file = getattr(cfg, "durations_file", None)
+        if durations_file and os.path.exists(durations_file):
+            try:
+                self.durations_dict = torch.load(durations_file, map_location="cpu")
+                print(f"  ✓ Loaded {len(self.durations_dict):,} ground-truth MFA durations from '{durations_file}'")
+            except Exception as e:
+                print(f"  ⚠️ Warning: Could not load durations file '{durations_file}': {e}")
+
     def __len__(self):
         return len(self.index)
 
@@ -231,10 +241,23 @@ class DirectParquetTamilDataset(Dataset):
                 mel_log = torch.log(torch.clamp(mel, min=1e-5))
                 mel_len = mel_log.shape[1]
 
-                if mel_len < 4 or mel_len < text_len:
-                    continue
+                # 4. Ground-Truth Duration Attachment (IndicMFA with Proportional Fallback)
+                sample_key = f"{os.path.basename(file_path)}_rg{rg_idx}_r{row_in_rg}"
+                gt_dur = None
+                if self.durations_dict is not None and sample_key in self.durations_dict:
+                    entry = self.durations_dict[sample_key]
+                    durs = entry.get("durations", [])
+                    if len(durs) == text_len:
+                        gt_dur = torch.tensor(durs, dtype=torch.long)
 
-                return token_ids, text_len, mel_log, mel_len, audio_tensor, audio_len
+                if gt_dur is None:
+                    # Fallback to proportional duration for unaligned samples
+                    p_dur = max(1, mel_len // text_len)
+                    gt_dur = torch.full((text_len,), p_dur, dtype=torch.long)
+                    diff = mel_len - gt_dur.sum().item()
+                    gt_dur[-1] = max(1, gt_dur[-1].item() + diff)
+
+                return token_ids, text_len, mel_log, mel_len, audio_tensor, audio_len, gt_dur
 
             except Exception:
                 continue
@@ -243,7 +266,8 @@ class DirectParquetTamilDataset(Dataset):
         dummy_ids = torch.tensor([1, 2], dtype=torch.long)
         dummy_mel = torch.full((self.mel_channels, 16), -11.5, dtype=torch.float32)
         dummy_audio = torch.zeros(16 * self.hop_length, dtype=torch.float32)
-        return dummy_ids, 2, dummy_mel, 16, dummy_audio, 16 * self.hop_length
+        dummy_dur = torch.tensor([8, 8], dtype=torch.long)
+        return dummy_ids, 2, dummy_mel, 16, dummy_audio, 16 * self.hop_length, dummy_dur
 
 
 def tamil_tts_collate_fn(batch):
@@ -267,13 +291,17 @@ def tamil_tts_collate_fn(batch):
     padded_tokens = torch.zeros(B, max_text_len, dtype=torch.long)
     padded_mel = torch.full((B, 80, max_mel_len), -11.5, dtype=torch.float32)
     padded_audio = torch.zeros(B, max_audio_len, dtype=torch.float32)
+    padded_dur = torch.zeros(B, max_text_len, dtype=torch.long)
 
-    for i, (toks, t_len, mel, m_len, aud, a_len) in enumerate(batch):
+    for i, item in enumerate(batch):
+        toks, t_len, mel, m_len, aud, a_len = item[:6]
         padded_tokens[i, :t_len] = toks[:t_len]
         padded_mel[i, :, :m_len] = mel[:, :m_len]
         padded_audio[i, :a_len] = aud[:a_len]
+        if len(item) > 6 and item[6] is not None:
+            padded_dur[i, :t_len] = item[6][:t_len]
 
-    return padded_tokens, text_lens, padded_mel, mel_lens, padded_audio, audio_lens
+    return padded_tokens, text_lens, padded_mel, mel_lens, padded_audio, audio_lens, padded_dur
 
 
 # Aliases for backward compatibility

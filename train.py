@@ -93,7 +93,7 @@ def evaluate(model, val_loader, srfd_loss_fn, device, local_rank=0):
     for batch in pbar:
         if batch is None:
             continue
-        text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch
+        text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch[:6]
         text_tokens = text_tokens.to(device)
         text_lens   = text_lens.to(device)
         ref_mel     = ref_mel.to(device)
@@ -266,22 +266,31 @@ def train_worker(local_rank, world_size, cfg):
                 if batch is None or global_step >= cfg.total_steps:
                     continue
 
-                text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch
+                if len(batch) >= 7:
+                    text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens, batch_gt_dur = batch
+                    batch_gt_dur = batch_gt_dur.to(device)
+                else:
+                    text_tokens, text_lens, ref_mel, mel_lens, real_audio, audio_lens = batch
+                    batch_gt_dur = None
+
                 text_tokens = text_tokens.to(device)
                 text_lens   = text_lens.to(device)
                 ref_mel     = ref_mel.to(device)
                 mel_lens    = mel_lens.to(device)
                 real_audio  = real_audio.to(device)
 
-                # Build proportional ground-truth duration targets (Kokoro-style bootstrap)
+                # Ground-truth duration targets (IndicMFA Ground-Truth with Proportional Fallback)
                 target_dur = None
                 if getattr(cfg, "use_gt_durations", True):
-                    target_dur = torch.zeros_like(text_tokens, dtype=torch.float32)
-                    for b_i in range(text_tokens.size(0)):
-                        t_len = max(int(text_lens[b_i].item()), 1)
-                        m_len = max(int(mel_lens[b_i].item()), 1)
-                        base_d = m_len / t_len
-                        target_dur[b_i, :t_len] = base_d
+                    if batch_gt_dur is not None and (batch_gt_dur > 0).any():
+                        target_dur = batch_gt_dur.float()
+                    else:
+                        target_dur = torch.zeros_like(text_tokens, dtype=torch.float32)
+                        for b_i in range(text_tokens.size(0)):
+                            t_len = max(int(text_lens[b_i].item()), 1)
+                            m_len = max(int(mel_lens[b_i].item()), 1)
+                            base_d = m_len / t_len
+                            target_dur[b_i, :t_len] = base_d
 
                 is_accumulating = is_distributed and ((batch_idx + 1) % cfg.grad_accum_steps != 0)
                 sync_context = model.no_sync() if is_accumulating else nullcontext()
