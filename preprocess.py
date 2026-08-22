@@ -27,9 +27,36 @@ from tqdm.auto import tqdm
 from preprocess.g2g import segment_tamil_g2g, load_g2g_dictionary
 from preprocess.align import run_mfa_alignment, extract_durations_from_textgrid
 
-DICT_URL = "https://github.com/AI4Bharat/IndicMFA/releases/download/Tamil/Tamil_Dictionary_g2g.txt"
-MODEL_URL = "https://github.com/AI4Bharat/IndicMFA/releases/download/Tamil/Tamil_Acoustic_Model.zip"
+def decode_audio_sample(row):
+    audio_val = row.get("audio")
+    if isinstance(audio_val, dict):
+        raw_b = audio_val.get("bytes")
+        if raw_b is not None and len(raw_b) > 100:
+            arr, orig_sr = sf.read(io.BytesIO(raw_b))
+            return arr, orig_sr
+        raw_arr = audio_val.get("array")
+        if raw_arr is not None:
+            sr = audio_val.get("sampling_rate", 22050)
+            return np.array(raw_arr, dtype=np.float32), sr
+        path_v = audio_val.get("path")
+        if path_v and os.path.exists(path_v):
+            arr, orig_sr = sf.read(path_v)
+            return arr, orig_sr
 
+    raw_b = row.get("bytes")
+    if isinstance(raw_b, (bytes, bytearray)) and len(raw_b) > 100:
+        arr, orig_sr = sf.read(io.BytesIO(raw_b))
+        return arr, orig_sr
+
+    if isinstance(audio_val, (bytes, bytearray)) and len(audio_val) > 100:
+        arr, orig_sr = sf.read(io.BytesIO(audio_val))
+        return arr, orig_sr
+
+    for k in ["wav_path", "audio_filepath", "path", "filename"]:
+        p = row.get(k)
+        if isinstance(p, str) and os.path.exists(p):
+            arr, orig_sr = sf.read(p)
+            return arr, orig_sr
 
 def download_indic_mfa_assets(dest_dir="indic_mfa_tamil"):
     os.makedirs(dest_dir, exist_ok=True)
@@ -37,14 +64,22 @@ def download_indic_mfa_assets(dest_dir="indic_mfa_tamil"):
     model_zip = os.path.join(dest_dir, "Tamil_Acoustic_Model.zip")
 
     if not os.path.exists(dict_path):
-        print(f"Downloading Tamil G2G Dictionary from {DICT_URL}...")
-        urllib.request.urlretrieve(DICT_URL, dict_path)
-        print("  ✓ Dictionary ready.")
+        dict_url = "https://github.com/AI4Bharat/IndicMFA/releases/download/Tamil/Tamil_Dictionary_g2g.txt"
+        print(f"Downloading Tamil G2G Dictionary from {dict_url}...")
+        try:
+            urllib.request.urlretrieve(dict_url, dict_path)
+            print("  ✓ Dictionary ready.")
+        except Exception as e:
+            print(f"  ⚠️ Warning: Offline or download error: {e}")
 
     if not os.path.exists(model_zip):
-        print(f"Downloading Tamil Acoustic Model from {MODEL_URL}...")
-        urllib.request.urlretrieve(MODEL_URL, model_zip)
-        print("  ✓ Acoustic Model ready.")
+        model_url = "https://github.com/AI4Bharat/IndicMFA/releases/download/Tamil/Tamil_Acoustic_Model.zip"
+        print(f"Downloading Tamil Acoustic Model from {model_url}...")
+        try:
+            urllib.request.urlretrieve(model_url, model_zip)
+            print("  ✓ Acoustic Model ready.")
+        except Exception as e:
+            print(f"  ⚠️ Warning: Offline or download error: {e}")
 
     return dict_path, model_zip
 
@@ -172,12 +207,10 @@ def main():
                 if not text:
                     continue
 
-                audio_data = row.get("audio")
-                raw_bytes = audio_data.get("bytes") if isinstance(audio_data, dict) else None
-                if not raw_bytes or len(raw_bytes) < 100:
+                arr, orig_sr = decode_audio_sample(row)
+                if arr is None or len(arr) < 100:
                     continue
 
-                arr, orig_sr = sf.read(io.BytesIO(raw_bytes))
                 if arr.ndim > 1:
                     arr = arr.mean(axis=1)
 
