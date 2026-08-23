@@ -349,7 +349,7 @@ TamilTTSDataset = DirectParquetTamilDataset
 
 
 def build_row_group_batches(ds, batch_size, seed=42,
-                            super_chunk=2048, min_batch_frac=0.5, positions=None):
+                            min_batch_frac=0.5, positions=None):
     """Compose batches whose members all live in ONE parquet row group.
 
     One row group of the AI4Bharat parquets is ~95 rows / ~160 MB compressed.
@@ -358,14 +358,18 @@ def build_row_group_batches(ds, batch_size, seed=42,
     it once per sample. Members are length-sorted within each group so its
     batches are near-uniform (~4% pad waste vs ~55% for random batches).
 
+    Composition covers EVERY indexed sample with a durations entry exactly
+    once (groups have ~90 usable members -> 5-6 full batches + one tail).
+    Tail batches smaller than min_batch_frac * batch_size would add a weakly-
+    representative optimizer step, so their members are redistributed into
+    the group's other batches instead (keeps coverage at 100%).
+
     Args:
         ds: DirectParquetTamilDataset (uses .index and .durations_dict).
-        batch_size: target batch size; tail batches may be smaller.
+        batch_size: target batch size.
         seed: shuffling seed for reproducibility.
-        super_chunk: number of duration-sorted samples per mixing window;
-            larger = tighter global length homogeneity across neighbors.
-        min_batch_frac: drop tail batches smaller than this fraction of the
-            target size (they would only add an unrepresentative step).
+        min_batch_frac: threshold below which a tail batch's members are
+            merged into the group's last full batch (slightly oversizing it).
         positions: optional iterable restricting composition to these dataset
             positions (e.g. a Subset's indices). Batches are returned in the
             SAME position space as given here (dataset positions), not remapped.
@@ -383,37 +387,30 @@ def build_row_group_batches(ds, batch_size, seed=42,
         if entry is not None and entry.get("durations"):
             len_of[i] = int(round(sum(entry["durations"])))
 
-    pool = [i for i in range(len(ds)) if i in len_of]
-    if not pool:
-        raise RuntimeError("No samples with MFA durations to build row-group batches.")
+    groups = {}
+    for i in sorted(len_of.keys()):
+        groups.setdefault(file_rg_of[i], []).append(i)
 
     rng = random.Random(seed)
-    pool.sort(key=lambda i: len_of[i])  # global length sort
+    min_len = max(1, int(round(batch_size * min_batch_frac)))
 
-    # Group positions by (file, row-group) inside each super-chunk.
-    batches = []
-    for s in range(0, len(pool), super_chunk):
-        chunk = pool[s:s + super_chunk]
-        rng.shuffle(chunk)
-        pools_by_rg = {}
-        for i in chunk:
-            pools_by_rg.setdefault(file_rg_of[i], []).append(i)
-
-        # Slice each row group's members into batches WITHIN the group, then
-        # shuffle batch order. A tiny remainder (< batch) may merge with the
-        # next group's remainder; those merged tail batches are filtered out
-        # below when they fall under min_batch_frac.
-        group_batches = []
-        for members in pools_by_rg.values():
-            members.sort(key=lambda i: len_of[i])
-            for s2 in range(0, len(members), batch_size):
-                group_batches.append(members[s2:s2 + batch_size])
+    all_batches = []
+    for gid in sorted(groups.keys()):          # deterministic order
+        members = groups[gid]
+        members.sort(key=lambda i: len_of[i])  # length-homogeneous batches
+        group_batches = [members[s:s + batch_size]
+                         for s in range(0, len(members), batch_size)]
+        # Fold undersized tails into the previous batch of the same group so
+        # every sample is trained on (a slightly oversized final batch beats
+        # dropping 10% of the corpus).
+        if len(group_batches) > 1 and len(group_batches[-1]) < min_len:
+            tail = group_batches.pop()
+            group_batches[-1].extend(tail)
         rng.shuffle(group_batches)
-        batches.extend(group_batches)
+        all_batches.extend(group_batches)
 
-    batches = [b for b in batches
-               if len(b) >= max(1, int(round(batch_size * min_batch_frac)))]
-    return batches
+    rng.shuffle(all_batches)
+    return all_batches
 
 
 class RowGroupBatchSampler(Sampler):
@@ -427,7 +424,7 @@ class RowGroupBatchSampler(Sampler):
         Remaining args are forwarded to build_row_group_batches.
     """
 
-    def __init__(self, ds, batch_size, seed=42, super_chunk=2048,
+    def __init__(self, ds, batch_size, seed=42,
                  min_batch_frac=0.5, rank=0, world_size=1):
         # Accept a Subset transparently: compose over its members and remap
         # into SUBSET space (DataLoader over a Subset expects subset indices).
@@ -435,14 +432,13 @@ class RowGroupBatchSampler(Sampler):
             base_indices = list(ds.indices)
             pos_to_subset = {p: si for si, p in enumerate(base_indices)}
             batches = build_row_group_batches(
-                ds.dataset, batch_size, seed=seed, super_chunk=super_chunk,
+                ds.dataset, batch_size, seed=seed,
                 min_batch_frac=min_batch_frac, positions=set(base_indices),
             )
             batches = [[pos_to_subset[p] for p in b] for b in batches]
         else:
             batches = build_row_group_batches(
-                ds, batch_size, seed=seed, super_chunk=super_chunk,
-                min_batch_frac=min_batch_frac,
+                ds, batch_size, seed=seed, min_batch_frac=min_batch_frac,
             )
         # DDP: interleave-shard so ranks see DISJOINT batch sets while every
         # batch keeps its single-row-group locality. Across the 4 ranks an
