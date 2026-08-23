@@ -339,6 +339,43 @@ def evaluate(model, val_loader, device, cfg, srfd_bundle=None, local_rank=0):
     return total_mel / max(count, 1), total_srfd / max(count, 1)
 
 
+def maybe_validate_and_save(model, net, ema, opt_g, sched_g, opt_d, val_loader,
+                            device, cfg, global_step, best_val_loss,
+                            srfd_bundle=None, local_rank=0, is_distributed=False):
+    """Single validation + checkpointing entry point (industry-standard cadence).
+
+    Called ONLY on step-based cadence (global_step % save_every == 0) or once at
+    training end. Validates on all ranks (DDP requires collective participation),
+    but checkpoint writes / sample synthesis / best-model logic are rank-0-only.
+
+    Returns updated best_val_loss.
+    """
+    val_mel, val_srfd = evaluate(model, val_loader, device, cfg, srfd_bundle, local_rank)
+    if is_main_process(local_rank):
+        log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
+        extra = {"ema_state_dict": ema.state_dict(), "val_loss": float(val_mel)}
+        if global_step > 0:
+            save_checkpoint(
+                os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"),
+                model, opt_g, sched_g, opt_d, global_step, extra,
+            )
+        save_checkpoint(
+            os.path.join(cfg.checkpoint_dir, "latest.pt"),
+            model, opt_g, sched_g, opt_d, global_step, extra,
+        )
+        if val_mel < best_val_loss:
+            best_val_loss = val_mel
+            save_checkpoint(
+                os.path.join(cfg.checkpoint_dir, "best.pt"),
+                model, opt_g, sched_g, opt_d, global_step, extra,
+            )
+            log(f"  🏆 New Best Model Saved (Mel Loss: {best_val_loss:.4f})")
+        synthesize_samples(net, ema, val_loader, device, cfg, global_step)
+    if is_distributed:
+        dist.barrier()
+    return best_val_loss
+
+
 def train_worker(local_rank, world_size, cfg):
     is_distributed = world_size > 1
     if is_distributed:
@@ -598,45 +635,25 @@ def train_worker(local_rank, world_size, cfg):
                         })
 
                     if global_step > 0 and global_step % cfg.save_every == 0:
-                        val_mel, val_srfd = evaluate(model, val_loader, device, cfg, srfd_bundle, local_rank)
-                        if is_main_process(local_rank):
-                            log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
-                            extra = {"ema_state_dict": ema.state_dict(), "val_loss": float(val_mel)}
-                            save_checkpoint(
-                                os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"),
-                                model, opt_g, sched_g, opt_d, global_step, extra,
-                            )
-                            save_checkpoint(
-                                os.path.join(cfg.checkpoint_dir, "latest.pt"),
-                                model, opt_g, sched_g, opt_d, global_step, extra,
-                            )
-                            if val_mel < best_val_loss:
-                                best_val_loss = val_mel
-                                save_checkpoint(
-                                    os.path.join(cfg.checkpoint_dir, "best.pt"),
-                                    model, opt_g, sched_g, opt_d, global_step, extra,
-                                )
-                                log(f"  🏆 New Best Model Saved (Mel Loss: {best_val_loss:.4f})")
-                            synthesize_samples(net, ema, val_loader, device, cfg, global_step)
-                        if is_distributed:
-                            dist.barrier()
+                        best_val_loss = maybe_validate_and_save(
+                            model, net, ema, opt_g, sched_g, opt_d, val_loader,
+                            device, cfg, global_step, best_val_loss,
+                            srfd_bundle=srfd_bundle, local_rank=local_rank,
+                            is_distributed=is_distributed,
+                        )
 
-            val_mel, val_srfd = evaluate(model, val_loader, device, cfg, srfd_bundle, local_rank)
-            if is_main_process(local_rank):
-                log(f"\nEpoch {epoch+1} Complete | Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
-                extra = {"ema_state_dict": ema.state_dict(), "val_loss": float(val_mel)}
-                save_checkpoint(
-                    os.path.join(cfg.checkpoint_dir, "latest.pt"),
-                    model, opt_g, sched_g, opt_d, global_step, extra,
-                )
-                if val_mel < best_val_loss:
-                    best_val_loss = val_mel
-                    save_checkpoint(
-                        os.path.join(cfg.checkpoint_dir, "best.pt"),
-                        model, opt_g, sched_g, opt_d, global_step, extra,
-                    )
-            if is_distributed:
-                dist.barrier()
+            # End of epoch: NO extra validation pass. Checkpointing/validation follow
+            # the single step-based cadence (every save_every steps); an additional
+            # epoch-end evaluate() doubled cost with no benefit.
+            # A final save happens after the training loop below.
+
+        # Final checkpoint + validation at end of training.
+        best_val_loss = maybe_validate_and_save(
+            model, net, ema, opt_g, sched_g, opt_d, val_loader,
+            device, cfg, max(global_step, 1), best_val_loss,
+            srfd_bundle=srfd_bundle, local_rank=local_rank,
+            is_distributed=is_distributed,
+        )
 
     finally:
         if is_distributed and dist.is_initialized():
