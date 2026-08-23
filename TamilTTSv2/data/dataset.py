@@ -9,6 +9,7 @@ High-Throughput Streaming Parquet Dataset for TamilTTSv2 (FastPitch / RAD-TTS St
 """
 import glob
 import io
+import math
 import os
 import random
 
@@ -293,7 +294,10 @@ def tamil_tts_collate_fn(batch):
     out = {
         "tokens": torch.zeros(B, max_text_len, dtype=torch.long),
         "token_lens": token_lens,
-        "mel": torch.full((B, batch[0][2].shape[0], max_mel_len), -4.0, dtype=torch.float32),
+        # Pad fill = the ln-mel silence floor (log of near-zero energy), matching
+        # MelExtractor's LOG_FLOOR. The old -4.0 assumed the removed [-4,4] normalization.
+        "mel": torch.full((B, batch[0][2].shape[0], max_mel_len),
+                          math.log(1e-5), dtype=torch.float32),
         "mel_lens": mel_lens,
         "audio": torch.zeros(B, max_audio_len, dtype=torch.float32),
         "audio_lens": audio_lens,

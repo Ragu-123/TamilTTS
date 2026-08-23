@@ -62,8 +62,11 @@ class TamilTTSv2(nn.Module):
             ff_dim=ff_dim, style_dim=style_dim,
         )
         self.mel_proj = nn.Linear(hidden_dim, self.mel_channels)
+        # Bias init at the mean of the target mel range so early predictions are in-distribution.
+        # Raw Coqui ln-mel targets average around -7 (range ~[-14, 2]); the old -2.5 assumed
+        # the previous [-4, 4] normalized range.
         with torch.no_grad():
-            self.mel_proj.bias.fill_(-2.5)
+            self.mel_proj.bias.fill_(-7.0)
 
         self.postnet = PostNet(mel_dim=self.mel_channels, postnet_dim=postnet_dim)
 

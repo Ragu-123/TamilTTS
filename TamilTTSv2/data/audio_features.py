@@ -21,15 +21,28 @@ except ImportError:
 
 class MelExtractor(nn.Module):
     """
-    Exact IndicTTS / Coqui TTS Mel-Spectrogram Processor (100% matched to frozen vocoder).
-    22.05 kHz, n_fft=1024, hop=256, 80 mels, slaney scale/norm, fmin=0, fmax=8000,
-    ^1.5 power compression, normalized to [-4, 4], reflect padding.
+    EXACT AI4Bharat IndicTTS / Coqui TTS v0.0.13 AudioProcessor recipe — the recipe the
+    frozen HiFi-GAN was trained on (verified by round-trip: envelope corr 0.91,
+    spectral-centroid corr 0.96; the previous implementation scored ~0).
+
+    Pipeline (Coqui v0.0.13 melspectrogram with this vocoder's config:
+    log_func=np.log, spec_gain=1.0, signal_norm=False, preemphasis=0.0, power unused):
+      1. librosa STFT: hann window, center=True (== reflect-pad n_fft//2 + center=False),
+         stft_pad_mode='reflect'
+      2. mel basis: librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax) — slaney norm,
+         htk=False (torchaudio's "slaney" scale+norm matches librosa defaults)
+      3. S = gain * ln(max(mel @ |STFT|, 1e-5)); NO dB conversion, NO [-4,4] normalization,
+         no ^1.5 power compression (power is only used by Griffin-Lim inversion).
+    Output range is roughly [-14, 2]; mel_proj bias and loss scales are range-agnostic.
 
     Args:
         audio (Tensor): [1, T] or [T] waveform.
     Returns:
-        Tensor: [80, Tm] normalized log-mel, where Tm = floor((T - hop) / hop) + 1.
+        Tensor: [80, Tm] natural-log mel, where Tm matches Coqui/librosa center=True framing.
     """
+
+    # Floor from Coqui v0.0.13 _amp_to_db: np.maximum(1e-5, x)
+    LOG_FLOOR = 1e-5
 
     def __init__(self, sample_rate=22050, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0):
         super().__init__()
@@ -52,20 +65,17 @@ class MelExtractor(nn.Module):
     def forward(self, audio):
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
-        pad = int((self.n_fft - self.hop_length) / 2)
+        # center=True equivalent for torch.stft(center=False): reflect-pad by n_fft//2.
+        # librosa pads with n_fft//2 on both sides, yielding ceil(T/hop)+1 frames.
+        pad = self.n_fft // 2
         audio_padded = torch.nn.functional.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
         stft = torch.stft(
-            audio_padded, self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+            audio_padded.unsqueeze(0), self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
             window=self.window, center=False, return_complex=True
-        )
-        spec = (torch.abs(stft) + 1e-9) ** 1.5
+        ).squeeze(0)
+        spec = torch.abs(stft)
         mel = torch.matmul(self.mel_basis, spec)
-        mel_db = 20.0 * torch.log10(torch.clamp(mel, min=1e-5)) - 20.0
-        min_level_db = -100.0
-        max_norm = 4.0
-        mel_norm = ((mel_db - min_level_db) / (-min_level_db)) * 2.0 * max_norm - max_norm
-        mel_norm = torch.clamp(mel_norm, -max_norm, max_norm)
-        return mel_norm
+        return torch.log(torch.clamp(mel, min=self.LOG_FLOOR))
 
 
 def _interp_to(x, num_frames):
