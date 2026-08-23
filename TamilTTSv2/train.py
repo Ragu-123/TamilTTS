@@ -653,6 +653,7 @@ def main():
     parser.add_argument("--lr", type=float, default=None, help="Generator learning rate override")
     parser.add_argument("--disc_lr", type=float, default=None, help="Discriminator learning rate override")
     parser.add_argument("--steps", type=int, default=None, help="Total training steps override")
+    parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers per rank")
     args = parser.parse_args()
 
     cfg = Config()
@@ -672,6 +673,8 @@ def main():
         cfg.disc_lr = args.disc_lr
     if args.steps:
         cfg.total_steps = args.steps
+    if args.num_workers:
+        cfg.num_workers = args.num_workers
 
     train_mode, num_devices = auto_configure_hardware(cfg)
 
