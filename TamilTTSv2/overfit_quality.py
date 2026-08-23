@@ -162,7 +162,7 @@ def main():
         rand_f0 = torch.randn_like(f0g) * 2.0
         rand_en = torch.randn_like(en) * 2.0
         probe_f0, probe_en = pe_fn(rand_f0, rand_en, f0g, vc, en, mel_lens=ml)
-        n_voiced = int((vc[: ml.size(2)] > 0.5).sum().item())
+        n_voiced = int((vc > 0.5).sum().item())
     print(f"[SELF-TEST] voiced frames in batch: {n_voiced} | "
           f"f0_loss(random pred)={float(probe_f0):.4f} | en_loss(random pred)={float(probe_en):.4f}", flush=True)
     print("[SELF-TEST] if f0_loss(random) is large (>0.3), the pathway works; "
