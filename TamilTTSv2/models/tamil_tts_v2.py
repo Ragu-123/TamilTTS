@@ -6,7 +6,7 @@ try:
     from .modules import sequence_mask, length_regulate
     from .text_encoder import TextEncoder
     from .style_encoder import StyleEncoder
-    from .predictors import DurationHead, PitchHead, EnergyHead, PitchEmbedder
+    from .predictors import DurationHead, PitchHead, EnergyHead, PitchEmbedder, EnergyEmbedder
     from .decoder import MelDecoder
     from .postnet import PostNet
     from .vocoder import load_pretrained_vocoder
@@ -14,7 +14,7 @@ except ImportError:
     from modules import sequence_mask, length_regulate
     from text_encoder import TextEncoder
     from style_encoder import StyleEncoder
-    from predictors import DurationHead, PitchHead, EnergyHead, PitchEmbedder
+    from predictors import DurationHead, PitchHead, EnergyHead, PitchEmbedder, EnergyEmbedder
     from decoder import MelDecoder
     from postnet import PostNet
     from vocoder import load_pretrained_vocoder
@@ -31,7 +31,7 @@ class TamilTTSv2(nn.Module):
         hidden_dim = getattr(cfg, "hidden_dim", 512)
         text_encoder_layers = getattr(cfg, "text_encoder_layers", 6)
         decoder_layers = getattr(cfg, "decoder_layers", 4)
-        num_heads = getattr(cfg, "heads", 8)
+        num_heads = getattr(cfg, "heads", None) or getattr(cfg, "text_encoder_heads", 8)
         ff_dim = getattr(cfg, "ff_dim", 1024)
         postnet_dim = getattr(cfg, "postnet_dim", 256)
         style_dim = getattr(cfg, "style_dim", 256)
@@ -44,6 +44,7 @@ class TamilTTSv2(nn.Module):
         self.text_encoder = TextEncoder(
             vocab_size=vocab_size, hidden_dim=hidden_dim,
             num_layers=text_encoder_layers, num_heads=num_heads,
+            ff_dim=ff_dim,
         )
         self.style_encoder = StyleEncoder(
             mel_channels=self.mel_channels, hidden_dim=hidden_dim, style_dim=style_dim
@@ -54,6 +55,7 @@ class TamilTTSv2(nn.Module):
         self.pitch_head = PitchHead(hidden_dim, filter_channels)
         self.energy_head = EnergyHead(hidden_dim, filter_channels)
         self.pitch_embedder = PitchEmbedder(hidden_dim)
+        self.energy_embedder = EnergyEmbedder(hidden_dim)
 
         self.mel_decoder = MelDecoder(
             hidden_dim=hidden_dim, num_layers=decoder_layers, num_heads=num_heads,
@@ -141,15 +143,32 @@ class TamilTTSv2(nn.Module):
             ).squeeze(1)
         dec_in = expanded + self.pitch_embedder(f0_for_embed)
 
-        # 7. Energy
+        # 7. Energy: predicted on the pitch-conditioned stream (same wire as before),
+        # then embedded back into the decoder input so it actually conditions
+        # synthesis (FastSpeech2-style) instead of being a supervised-only output.
         energy_pred = self.energy_head(dec_in, mel_mask)              # [B, Tm]
+        energy_for_embed = energy_pred
+        if self.training and gt_energy is not None:
+            # Same GT/pred mix policy as pitch, keyed to the SAME coin flip so the
+            # decoder always sees one coherent prosody condition per step.
+            if not self.training or use_gt:
+                energy_for_embed = gt_energy
+            else:
+                energy_for_embed = energy_pred.detach()
+        if energy_for_embed.size(1) != expanded.size(1):
+            energy_for_embed = F.interpolate(
+                energy_for_embed.unsqueeze(1), size=expanded.size(1), mode="nearest"
+            ).squeeze(1)
+        dec_in = dec_in + self.energy_embedder(energy_for_embed)
+
+        # 8. Mel decoding
 
         # 8. Mel decoding
         h = self.mel_decoder(dec_in, style, mel_mask)                 # [B, Tm, H]
         mel_coarse = self.mel_proj(h)                                 # [B, Tm, 80]
         mel_pred = mel_coarse + self.postnet(mel_coarse)
 
-        # 9. Audio synthesis
+        # 9. Audio synthesis (renumbered: mel decode is step 8, this is 9)
         gen_audio = None
         if return_audio:
             gen_audio = self.vocoder(mel_pred)

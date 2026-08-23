@@ -11,6 +11,11 @@ Staged objectives (by global_step):
                                            up to weight_slm_final.
 
 Key behaviors:
+  - GT prosody (log-F0/voicing, energy) is passed during training; the model mixes
+    GT and predicted conditioning 50/50 (one shared coin flip per step) so the
+    decoder also sees the predicted-prosody distribution it gets at inference.
+  - GAN/SLM losses consume per-sample random crops aligned to true audio lengths
+    (no collate zero-padding enters the discriminators).
   - Reference conditioning uses torch.roll(mel, 1, dim=0): every utterance is styled by a
     DIFFERENT utterance to prevent style leakage.
   - Two optimizers: AdamW generator (cosine warmup schedule) + AdamW discriminator (betas 0.8/0.99).
@@ -121,6 +126,33 @@ def run_discriminators(mpd, mrd, audio):
     scores = list(scores_mpd) + list(scores_mrd)
     feats = [feats_mpd, feats_mrd]
     return scores, feats
+
+
+def crop_audio_pairs(real_audio, fake_audio, audio_lens, min_seg=8192):
+    """Per-sample matched crops with ZERO padding exposure.
+
+    For each sample i, pick one random window of length L_i = clamp(audio_lens[i],
+    min_seg, max_seg) and apply the SAME window to the real and generated waveform,
+    so the discriminators / SLM compare aligned content instead of collate
+    zero-padding vs. generated tail (the previous min-of-padded-lengths behavior).
+
+    Returns (real_seg [B, Lmax], fake_seg [B, Lmax], seg_lens [B]).
+    """
+    B = real_audio.size(0)
+    device = real_audio.device
+    max_len = real_audio.size(-1)
+    lens = torch.minimum(audio_lens.to(device).clamp(max=min_seg), torch.full_like(audio_lens, max_len))
+    lens = lens.clamp(min=1)
+
+    seg_real = real_audio.new_zeros(B, int(lens.max().item()))
+    seg_fake = fake_audio.new_zeros(B, seg_real.size(1))
+    for i in range(B):
+        L = int(lens[i].item())
+        start = int(torch.randint(0, max(1, int(audio_lens[i]) - L + 1), ()).item()) \
+            if int(audio_lens[i]) > L else 0
+        seg_real[i, :L] = real_audio[i, start:start + L]
+        seg_fake[i, :L] = fake_audio[i, start:start + L]
+    return seg_real, seg_fake, lens
 
 
 def slm_weight(step, cfg):
@@ -277,7 +309,8 @@ def evaluate(model, val_loader, device, cfg, srfd_bundle=None, local_rank=0):
         ref_mel = torch.roll(batch["mel"], shifts=1, dims=0)
         ref_mel_lens = torch.roll(batch["mel_lens"], shifts=1)
 
-        want_audio = srfd_bundle is not None
+        # Only rank 0 holds the Whisper SR-FD bundle; other ranks skip audio rendering.
+        want_audio = srfd_bundle is not None and is_main_process(local_rank)
         with amp_context(device, cfg):
             out = net(
                 batch["tokens"], batch["token_lens"],
@@ -292,7 +325,7 @@ def evaluate(model, val_loader, device, cfg, srfd_bundle=None, local_rank=0):
         )
 
         srfd_val = 0.0
-        if srfd_bundle is not None and out.get("gen_audio") is not None:
+        if srfd_bundle is not None and local_rank == 0 and out.get("gen_audio") is not None:
             srfd_val = compute_srfd(srfd_bundle, batch["audio"], out["gen_audio"])
 
         total_mel += loss_mel.item()
@@ -378,7 +411,9 @@ def train_worker(local_rank, world_size, cfg):
     ema = EMA(decay=cfg.ema_decay)
     ema.register(net)
 
-    srfd_bundle = build_srfd_bundle(device, cfg)
+    # SR-FD is a rank-0-only validation metric; loading Whisper on every DDP rank
+    # wastes ~1.5 GB VRAM x world_size and slows startup.
+    srfd_bundle = build_srfd_bundle(device, cfg) if is_main_process(local_rank) else None
     slm_cache = {}
 
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
@@ -476,6 +511,8 @@ def train_worker(local_rank, world_size, cfg):
                         batch["tokens"], batch["token_lens"],
                         mel=batch["mel"], mel_lens=batch["mel_lens"],
                         gt_dur=batch["gt_dur"] if cfg.use_gt_durations else None,
+                        gt_logf0=batch["log_f0"], voiced=batch["voiced"],
+                        gt_energy=batch["energy"],
                         ref_mel=ref_mel, ref_mel_lens=ref_mel_lens,
                         style_dropout=cfg.style_dropout_p,
                         return_audio=gan_active,
@@ -503,10 +540,9 @@ def train_worker(local_rank, world_size, cfg):
                     gen_audio = out.get("gen_audio") if isinstance(out, dict) else None
 
                     if gan_active and gen_audio is not None:
-                        real_audio = batch["audio"]
-                        min_a = min(real_audio.size(-1), gen_audio.size(-1))
-                        real_cut = real_audio[..., :min_a]
-                        fake_cut = gen_audio[..., :min_a]
+                        real_cut, fake_cut, seg_lens = crop_audio_pairs(
+                            batch["audio"], gen_audio, batch["audio_lens"]
+                        )
 
                         scores_real, feats_real = run_discriminators(mpd, mrd, real_cut)
                         scores_fake_d, _ = run_discriminators(mpd, mrd, fake_cut.detach())

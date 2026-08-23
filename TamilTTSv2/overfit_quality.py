@@ -60,10 +60,20 @@ def main():
                     help="Duration loss weight; raise if free-run audio is unintelligible")
     ap.add_argument("--clip", type=float, default=1.0,
                     help="Grad-norm clip; 0.5 throttles predictor learning")
+    ap.add_argument("--style_dropout", type=float, default=None,
+                    help="Per-batch probability of replacing the reference style with "
+                         "default_style. MUST be > 0 in at least some runs for "
+                         "default_style to receive gradients (no-ref inference depends "
+                         "on it). Default: cfg.style_dropout_p.")
     ap.add_argument("--out", type=str, default="/kaggle/working/ttsv2_overfit_quality")
     args = ap.parse_args()
 
     cfg = Config()
+    style_dropout = (args.style_dropout if args.style_dropout is not None
+                     else float(getattr(cfg, "style_dropout_p", 0.0)))
+    print(f"[cfg] style_dropout = {style_dropout} "
+          f"({'default_style WILL train' if style_dropout > 0 else 'WARNING: default_style gets NO gradients'})",
+          flush=True)
     ngpu = torch.cuda.device_count()
     device = "cuda"
     use_dp = ngpu > 1
@@ -119,7 +129,7 @@ def main():
         o = runner(t, tl, mel=m, mel_lens=ml, gt_dur=gd, gt_logf0=f0,
                    voiced=vc, gt_energy=en,
                    ref_mel=torch.roll(m, 1, dims=0), ref_mel_lens=torch.roll(ml, 1),
-                   style_dropout=0.0, return_audio=return_audio,
+                   style_dropout=style_dropout, return_audio=return_audio,
                    target_len=int(m.size(2)))
         l1, _, _ = mel_fn(o["mel_pred"], o["mel_coarse"], m, mel_lens=ml)
         ld = dur_fn(o["log_dur"], gd, token_lens=tl)
@@ -214,7 +224,7 @@ def main():
         tt = torch.tensor(tok_i).unsqueeze(0).to(device)
         tll = torch.tensor([tlen_i]).to(device)
         kw = dict(ref_mel=ref.to(device), ref_mel_lens=rl.to(device),
-                  style_dropout=0.0, return_audio=True)
+                  style_dropout=0.0, return_audio=True)  # eval: always use the real ref
         with torch.no_grad():
             otf = model(tt, tll, mel=mel_i.unsqueeze(0).to(device),
                         mel_lens=torch.tensor([mlen_i]).to(device),

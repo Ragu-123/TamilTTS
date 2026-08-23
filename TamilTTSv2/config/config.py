@@ -19,11 +19,14 @@ class Config:
     vocoder_config = "/kaggle/input/notebooks/sanjaynn/tamiltts-vocoder/indic_tts_tamil_clean/hifigan_config.json"
 
     # --- Model Architecture ---
+    # `heads` is the single canonical attention-head count (used by BOTH the text
+    # encoder and the decoder). `ff_dim` is the feedforward width for the decoder's
+    # ConvFF blocks AND the text encoder's TransformerEncoderLayer.
     vocab_size               = 384
     hidden_dim               = 512
     text_encoder_layers      = 6
     decoder_layers           = 4
-    text_encoder_heads       = 8
+    heads                    = 8
     ff_dim                   = 1024
     style_dim                = 256
     variance_filter_channels = 256

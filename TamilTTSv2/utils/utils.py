@@ -75,11 +75,21 @@ class EMA:
 
 
 def save_checkpoint(path, model, optimizer, scheduler=None, optimizer_disc=None, step=0, extra=None):
-    """Save a module-aware checkpoint including both optimizers, scheduler, step and extras."""
+    """Save a module-aware checkpoint including both optimizers, scheduler, step and extras.
+
+    The frozen vocoder submodule ("vocoder.") is EXCLUDED: its weights are immutable
+    and always re-loaded from cfg.vocoder_ckpt at construction. Storing them bloated
+    every checkpoint by ~56 MB (x3 files per save) for zero benefit.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    net = unwrap_model(model)
+    state = {
+        k: v for k, v in net.state_dict().items()
+        if not k.startswith("vocoder.")
+    }
     payload = {
         "step": step,
-        "model_state_dict": unwrap_model(model).state_dict(),
+        "model_state_dict": state,
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "optimizer_disc_state_dict": optimizer_disc.state_dict() if optimizer_disc is not None else None,

@@ -33,7 +33,11 @@ TAMIL_G2G_TOKENS = [
     'ஸ', 'ஸா', 'ஸி', 'ஸீ', 'ஸு', 'ஸூ', 'ஸெ', 'ஸே', 'ஸை', 'ஸொ', 'ஸோ', 'ஸௌ', 'ஸ்',
     'ஹ', 'ஹா', 'ஹி', 'ஹீ', 'ஹு', 'ஹூ', 'ஹெ', 'ஹே', 'ஹை', 'ஹொ', 'ஹோ', 'ஹௌ', 'ஹ்',
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    '.', ',', '!', '?', ';', ':', '-', "'", '"', '(', ')'
+    '.', ',', '!', '?', ';', ':', '-', "'", '"', '(', ')',
+    # Standalone vowel signs observed in the MFA durations file (decomposed
+    # aksharas from ASR-transcript mismatches). Kept as first-class tokens so the
+    # dataset no longer maps them to <unk>.
+    'ா', 'ி', 'ு', 'ூ', 'ெ', 'ே', 'ை', 'ொ', 'ோ', 'ௌ', 'ௗ',
 ]
 
 VOCAB_SIZE = 384
@@ -58,7 +62,7 @@ def segment_tamil_g2g(text, valid_set):
         text (str): Raw Tamil text.
         valid_set (Set[str]): Valid G2G tokens (typically set(TAMIL_G2G_TOKENS)).
     Returns:
-        str: Space-separated token string.
+        str: Space-separated token string (no sil tokens; whitespace-separated words).
     """
     tokens = []
     i = 0
@@ -79,3 +83,56 @@ def segment_tamil_g2g(text, valid_set):
             tokens.append(text[i])
             i += 1
     return " ".join([t for t in tokens if t.strip()])
+
+
+# Pauses that MFA transcribes with explicit 'sil' entries. Sentence-enders and
+# clause commas both get an inserted 'sil' (MFA annotates phrase-final pauses of
+# varying length with the same symbol; the duration head learns the length from
+# data). Word-internal spaces are NOT marked — the durations file contains zero
+# space tokens.
+PAUSE_PUNCT = {'.', ',', '!', '?', ';', ':'}
+
+
+def tokens_with_sil(text, valid_set):
+    """Tokenize text into an ordered token list including 'sil' boundary markers.
+
+    THE canonical inference-side tokenizer. Matches the MFA training convention:
+    every utterance starts/ends with 'sil' and pause punctuation inserts 'sil'
+    between clauses. Inference sequences therefore come from the same distribution
+    the duration/pitch heads and decoder were trained on.
+
+    Args:
+        text (str): Raw Tamil text.
+        valid_set (Set[str]): Valid G2G tokens.
+    Returns:
+        List[str]: Token sequence beginning and ending with 'sil'.
+    """
+    out = ["sil"]
+    pending_pause = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in PAUSE_PUNCT:
+            pending_pause = True
+            i += 1
+            continue
+        if ch in PUNCT_SET:  # whitespace / quotes — no sil, just skipped
+            i += 1
+            continue
+        if pending_pause and len(out) > 1:
+            out.append("sil")
+            pending_pause = False
+        matched = False
+        for l in [3, 2, 1]:
+            cand = text[i:i + l]
+            if cand in valid_set:
+                out.append(cand)
+                i += l
+                matched = True
+                break
+        if not matched:
+            out.append(ch)
+            i += 1
+    if len(out) > 1:
+        out.append("sil")
+    return out

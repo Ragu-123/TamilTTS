@@ -81,3 +81,20 @@ class PitchEmbedder(nn.Module):
         logf0: [B, T] -> [B, T, hidden_dim]
         """
         return self.net(logf0.unsqueeze(1)).transpose(1, 2)
+
+
+class EnergyEmbedder(nn.Module):
+    """Embed log-energy contour into hidden space (same wire as PitchEmbedder)."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+        )
+
+    def forward(self, energy):
+        """
+        energy: [B, T] -> [B, T, hidden_dim]
+        """
+        return self.net(energy.unsqueeze(1)).transpose(1, 2)

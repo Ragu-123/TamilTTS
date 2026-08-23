@@ -13,17 +13,24 @@ import torch
 from config import Config
 from data.audio_features import MelExtractor
 from models.tamil_tts_v2 import TamilTTSv2
-from preprocess.g2g import TAMIL_G2G_TOKENS, segment_tamil_g2g
+from preprocess.g2g import TAMIL_G2G_TOKENS, tokens_with_sil
 
 
 def build_encoder():
+    """Text -> (tokens, lens) with MFA-style sil boundaries.
+
+    Uses the same token conventions as training (leading/trailing sil, sil at
+    punctuation pauses) so the variance heads and decoder see their trained
+    distribution at inference.
+    """
     tok2id = {tok: i for i, tok in enumerate(TAMIL_G2G_TOKENS)}
     unk_id = tok2id.get("<unk>", 2)
+    valid_set = set(TAMIL_G2G_TOKENS)
 
     def encode(text, max_len):
-        segmented = segment_tamil_g2g(text, set(TAMIL_G2G_TOKENS))
-        ids = [tok2id.get(tok, unk_id) for tok in segmented.split()]
-        ids = ids[:max_len] or [unk_id]
+        toks = tokens_with_sil(text, valid_set)
+        ids = [tok2id.get(tok, unk_id) for tok in toks]
+        ids = ids[:max_len] or [tok2id.get("sil", 1), tok2id.get("sil", 1)]
         tokens = torch.tensor([ids], dtype=torch.long)
         token_lens = torch.tensor([len(ids)], dtype=torch.long)
         return tokens, token_lens

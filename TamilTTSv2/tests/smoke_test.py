@@ -35,7 +35,8 @@ def tiny_cfg():
         hidden_dim=64,
         text_encoder_layers=1,
         decoder_layers=1,
-        text_encoder_heads=2,
+        heads=2,
+        text_encoder_heads=2,  # legacy alias; model prefers cfg.heads
         ff_dim=128,
         style_dim=32,
         variance_filter_channels=64,
