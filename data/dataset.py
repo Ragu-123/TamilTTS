@@ -420,25 +420,23 @@ class RowGroupBatchSampler(Sampler):
     """Yields pre-composed row-group-local batches; reshuffles every epoch.
 
     Args:
-        ds: DirectParquetTamilDataset.
+        ds: DirectParquetTamilDataset or a torch.utils.data.Subset of one.
         batch_size: target batch size (tail batches may be smaller).
-        indices: optional Subset.indices — composition is restricted to these
-            dataset positions and batches are remapped into SUBSET space
-            (DataLoader over a torch.utils.data.Subset expects subset indices).
         rank/world_size: DDP sharding — each rank gets a disjoint interleave
             of the composed batches; locality within a batch is preserved.
         Remaining args are forwarded to build_row_group_batches.
     """
 
     def __init__(self, ds, batch_size, seed=42, super_chunk=2048,
-                 min_batch_frac=0.5, indices=None, rank=0, world_size=1):
-        if indices is not None:
-            # Compose over subset members only (dataset-position space), then
-            # remap to SUBSET space: DataLoader[Subset] expects subset indices.
-            pos_to_subset = {p: si for si, p in enumerate(indices)}
+                 min_batch_frac=0.5, rank=0, world_size=1):
+        # Accept a Subset transparently: compose over its members and remap
+        # into SUBSET space (DataLoader over a Subset expects subset indices).
+        if isinstance(ds, torch.utils.data.Subset):
+            base_indices = list(ds.indices)
+            pos_to_subset = {p: si for si, p in enumerate(base_indices)}
             batches = build_row_group_batches(
-                ds, batch_size, seed=seed, super_chunk=super_chunk,
-                min_batch_frac=min_batch_frac, positions=set(indices),
+                ds.dataset, batch_size, seed=seed, super_chunk=super_chunk,
+                min_batch_frac=min_batch_frac, positions=set(base_indices),
             )
             batches = [[pos_to_subset[p] for p in b] for b in batches]
         else:
