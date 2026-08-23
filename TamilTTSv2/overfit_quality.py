@@ -151,6 +151,23 @@ def main():
     rng = random.Random(7)
     order = list(range(len(batches)))
     eval_every = max(250, TOTAL // 12)
+
+    # --- self-test: prove the f0/energy loss pathway is live ---
+    with torch.no_grad():
+        b0 = batches[0]
+        t = b0["tokens"].to(device); tl = b0["token_lens"].to(device)
+        m = b0["mel"].to(device); ml = b0["mel_lens"].to(device)
+        gd = b0["gt_dur"].to(device); f0g = b0["log_f0"].to(device)
+        vc = b0["voiced"].to(device); en = b0["energy"].to(device)
+        rand_f0 = torch.randn_like(f0g) * 2.0
+        rand_en = torch.randn_like(en) * 2.0
+        probe_f0, probe_en = pe_fn(rand_f0, rand_en, f0g, vc, en, mel_lens=ml)
+        n_voiced = int((vc[: ml.size(2)] > 0.5).sum().item())
+    print(f"[SELF-TEST] voiced frames in batch: {n_voiced} | "
+          f"f0_loss(random pred)={float(probe_f0):.4f} | en_loss(random pred)={float(probe_en):.4f}", flush=True)
+    print("[SELF-TEST] if f0_loss(random) is large (>0.3), the pathway works; "
+          "a small trained f0 value later means GOOD fit, not zero supervision", flush=True)
+
     pbar = tqdm(range(1, TOTAL + 1), desc="overfit", unit="step",
                 dynamic_ncols=True, smoothing=0.1)
     last = {"mel": 0.0, "dur": 0.0, "f0": 0.0, "en": 0.0, "full": float("nan")}
@@ -170,14 +187,12 @@ def main():
         last["f0"], last["en"] = lf.item(), le.item()
         if step % eval_every == 0 or step == TOTAL:
             last["full"] = full_eval()
+            print(f"[eval] step {step}: FULL_mel={last['full']:.4f} | "
+                  f"mel={last['mel']:.4f} dur={last['dur']:.4f} "
+                  f"f0={last['f0']:.4f} en={last['en']:.4f} | "
+                  f"lr={lr_at(step):.2e} t={time.time()-t0:.0f}s", flush=True)
         pbar.set_postfix({
-            "mel": f"{last['mel']:.3f}",
-            "dur": f"{last['dur']:.3f}",
-            "f0": f"{last['f0']:.3f}",
-            "en": f"{last['en']:.3f}",
-            "FULL_mel": f"{last['full']:.4f}",
-            "lr": f"{lr_at(step):.1e}",
-            "s": f"{time.time()-t0:.0f}",
+            "FULL_mel": f"{last['full']:.3f}",
         })
     pbar.close()
 
