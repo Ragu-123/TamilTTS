@@ -10,6 +10,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio.functional as AF
 
 try:
@@ -110,11 +111,13 @@ def extract_f0(audio, sr=22050, hop_length=256, n_fft=1024):
         return zeros(), zeros()
 
     try:
+        used_pyworld = False
         if pw is not None:
             wav_np = flat.numpy().astype(np.float64)
             f0_ts, time_axis = pw.dio(wav_np, sr, frame_period=5.0)
             f0_np = pw.stonemask(wav_np, f0_ts, time_axis, sr)
             f0 = torch.from_numpy(np.ascontiguousarray(f0_np)).float()
+            used_pyworld = True
         else:
             pitch = AF.detect_pitch_frequency(flat, sample_rate=sr).flatten().float()
             f0 = pitch
@@ -122,7 +125,22 @@ def extract_f0(audio, sr=22050, hop_length=256, n_fft=1024):
     except Exception:
         return zeros(), zeros()
 
-    voiced_mask = (f0 > 0.0).float()
+    if used_pyworld:
+        # dio/stonemask emit 0 on unvoiced frames -> direct voicing mask.
+        voiced_mask = (f0 > 0.0).float()
+    else:
+        # torchaudio.detect_pitch_frequency returns a value for EVERY frame
+        # (no voicing detection). Gate by plausibility (human F0 range) and
+        # frame energy, otherwise silent frames get fake pitch supervision.
+        pad_len = num_frames * hop_length - flat.numel()
+        padded = F.pad(flat, (0, max(pad_len, 0)))[: num_frames * hop_length]
+        frames = padded.view(num_frames, hop_length)
+        rms = frames.pow(2).mean(dim=1).sqrt()
+        db = 20.0 * torch.log10(rms.clamp(min=1e-8))
+        energy_ok = db > (db.max() - 35.0)
+        plausible = (f0 >= 50.0) & (f0 <= 600.0)
+        voiced_mask = (plausible & energy_ok).float()
+
     log_f0 = torch.zeros(num_frames, dtype=torch.float32)
     voiced_idx = voiced_mask.bool()
     if voiced_idx.sum().item() < 5:
