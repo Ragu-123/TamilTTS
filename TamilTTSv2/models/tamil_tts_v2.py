@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from .modules import sequence_mask, length_regulate
@@ -125,6 +126,12 @@ class TamilTTSv2(nn.Module):
         f0_for_embed = pred_logf0
         if self.training and gt_logf0 is not None:
             f0_for_embed = gt_logf0
+        # Some dataset clips carry f0 frame counts that differ from mel length
+        # (MFA rounding / edge cases). Align to the decoder time axis explicitly.
+        if f0_for_embed.size(1) != expanded.size(1):
+            f0_for_embed = F.interpolate(
+                f0_for_embed.unsqueeze(1), size=expanded.size(1), mode="nearest"
+            ).squeeze(1)
         dec_in = expanded + self.pitch_embedder(f0_for_embed)
 
         # 7. Energy
