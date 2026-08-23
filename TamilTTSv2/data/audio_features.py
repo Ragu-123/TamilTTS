@@ -65,16 +65,18 @@ class MelExtractor(nn.Module):
     def forward(self, audio):
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
+        if audio.dim() == 3:  # [B, 1, T] -> [B, T]
+            audio = audio.squeeze(1)
         # center=True equivalent for torch.stft(center=False): reflect-pad by n_fft//2.
         # librosa pads with n_fft//2 on both sides, yielding ceil(T/hop)+1 frames.
         pad = self.n_fft // 2
-        audio_padded = torch.nn.functional.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
+        audio_padded = torch.nn.functional.pad(audio, (pad, pad), mode='reflect')
         stft = torch.stft(
-            audio_padded.unsqueeze(0), self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+            audio_padded, self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
             window=self.window, center=False, return_complex=True
-        ).squeeze(0)
+        )                                    # [B, F, Tm]
         spec = torch.abs(stft)
-        mel = torch.matmul(self.mel_basis, spec)
+        mel = torch.matmul(self.mel_basis, spec)   # mel_basis broadcasts over batch
         return torch.log(torch.clamp(mel, min=self.LOG_FLOOR))
 
 
