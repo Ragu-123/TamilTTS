@@ -153,7 +153,7 @@ def main():
     eval_every = max(250, TOTAL // 12)
     pbar = tqdm(range(1, TOTAL + 1), desc="overfit", unit="step",
                 dynamic_ncols=True, smoothing=0.1)
-    last = {"mel": 0.0, "dur": 0.0, "full": float("nan")}
+    last = {"mel": 0.0, "dur": 0.0, "f0": 0.0, "en": 0.0, "full": float("nan")}
     for step in pbar:
         if (step - 1) % len(batches) == 0:
             rng.shuffle(order)
@@ -167,11 +167,14 @@ def main():
             [p for p in model.parameters() if p.requires_grad], args.clip)
         opt.step()
         last["mel"], last["dur"] = l1.item(), ld.item()
+        last["f0"], last["en"] = lf.item(), le.item()
         if step % eval_every == 0 or step == TOTAL:
             last["full"] = full_eval()
         pbar.set_postfix({
             "mel": f"{last['mel']:.3f}",
             "dur": f"{last['dur']:.3f}",
+            "f0": f"{last['f0']:.3f}",
+            "en": f"{last['en']:.3f}",
             "FULL_mel": f"{last['full']:.4f}",
             "lr": f"{lr_at(step):.1e}",
             "s": f"{time.time()-t0:.0f}",

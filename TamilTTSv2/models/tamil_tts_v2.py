@@ -128,7 +128,11 @@ class TamilTTSv2(nn.Module):
         pred_logf0 = self.pitch_head(expanded, mel_mask)              # [B, Tm]
         f0_for_embed = pred_logf0
         if self.training and gt_logf0 is not None:
-            f0_for_embed = gt_logf0
+            # Mix GT and predicted pitch so the decoder/pitch-embedder also see
+            # the predicted-f0 distribution they receive at inference.
+            # GT-only conditioning makes synthesis collapse (robotic/garbled).
+            use_gt = torch.rand(()).item() < 0.5
+            f0_for_embed = gt_logf0 if use_gt else pred_logf0.detach()
         # Some dataset clips carry f0 frame counts that differ from mel length
         # (MFA rounding / edge cases). Align to the decoder time axis explicitly.
         if f0_for_embed.size(1) != expanded.size(1):
