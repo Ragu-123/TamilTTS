@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--n_samples", type=int, default=20)
     ap.add_argument("--per_gpu_batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--dur_weight", type=float, default=3.0,
+                    help="Duration loss weight; raise if free-run audio is unintelligible")
+    ap.add_argument("--clip", type=float, default=1.0,
+                    help="Grad-norm clip; 0.5 throttles predictor learning")
     ap.add_argument("--out", type=str, default="/kaggle/working/ttsv2_overfit_quality")
     args = ap.parse_args()
 
@@ -156,11 +160,11 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         o, l1, ld, lf, le = fwd(batches[order[(step - 1) % len(batches)]])
-        loss = l1 + ld + lf + le
+        loss = l1 + args.dur_weight * ld + lf + le
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], 0.5)
+            [p for p in model.parameters() if p.requires_grad], args.clip)
         opt.step()
         last["mel"], last["dur"] = l1.item(), ld.item()
         if step % eval_every == 0 or step == TOTAL:
@@ -211,8 +215,9 @@ def main():
     with open(f"{outd}/texts.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"[4] wavs written to {outd}", flush=True)
-    print(f"QUALITY BAR: listen to s0_teacherforced.wav vs s0_original.wav; "
-          f"if still robotic rerun with --steps {(TOTAL * 3) // 2}", flush=True)
+    print(f"REMINDER: TF uses GT durations; FR uses predicted durations. "
+          f"If FR is unintelligible while TF is OK -> durations still underfit: "
+          f"rerun with --steps {(TOTAL * 3) // 2} --dur_weight {args.dur_weight * 2:.0f}", flush=True)
     print(f"DONE {time.time()-t0:.0f}s", flush=True)
 
 
