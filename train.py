@@ -26,7 +26,12 @@ Key behaviors:
 import os
 import gc
 import argparse
+import warnings
 from contextlib import nullcontext
+
+# Silence third-party deprecation noise (pyworld -> pkg_resources) before any
+# heavy import; module-level so DDP-spawned ranks inherit it on fresh import.
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
 import numpy as np
 import soundfile as sf
@@ -354,11 +359,10 @@ def maybe_validate_and_save(model, net, ema, opt_g, sched_g, opt_d, val_loader,
     if is_main_process(local_rank):
         log(f"\n[Step {global_step}] Val Mel Loss: {val_mel:.4f} | Val SR-FD: {val_srfd:.4f}")
         extra = {"ema_state_dict": ema.state_dict(), "val_loss": float(val_mel)}
-        if global_step > 0:
-            save_checkpoint(
-                os.path.join(cfg.checkpoint_dir, f"step_{global_step}.pt"),
-                model, opt_g, sched_g, opt_d, global_step, extra,
-            )
+        # Only two rolling checkpoints are kept: latest.pt (resume point) and
+        # best.pt (best val mel). latest.pt carries everything needed to resume
+        # exactly: model + generator optimizer/scheduler + discriminator
+        # optimizer + step + EMA shadow + val loss.
         save_checkpoint(
             os.path.join(cfg.checkpoint_dir, "latest.pt"),
             model, opt_g, sched_g, opt_d, global_step, extra,
