@@ -115,7 +115,8 @@ def main():
         o = runner(t, tl, mel=m, mel_lens=ml, gt_dur=gd, gt_logf0=f0,
                    voiced=vc, gt_energy=en,
                    ref_mel=torch.roll(m, 1, dims=0), ref_mel_lens=torch.roll(ml, 1),
-                   style_dropout=0.0, return_audio=return_audio)
+                   style_dropout=0.0, return_audio=return_audio,
+                   target_len=int(m.size(2)))
         l1, _, _ = mel_fn(o["mel_pred"], o["mel_coarse"], m, mel_lens=ml)
         ld = dur_fn(o["log_dur"], gd, token_lens=tl)
         lf, le = pe_fn(o["log_f0"], o["energy"], f0, vc, en, mel_lens=ml)

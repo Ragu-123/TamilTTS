@@ -72,7 +72,8 @@ class TamilTTSv2(nn.Module):
 
     def forward(self, tokens, token_lens, mel=None, mel_lens=None, gt_dur=None,
                 gt_logf0=None, voiced=None, gt_energy=None, ref_mel=None,
-                ref_mel_lens=None, style_dropout=0.0, return_audio=False):
+                ref_mel_lens=None, style_dropout=0.0, return_audio=False,
+                target_len=None):
         """
         tokens:   [B, Tt] int token ids
         token_lens: [B]
@@ -109,7 +110,9 @@ class TamilTTSv2(nn.Module):
             durations = torch.round(dur_pred).clamp(min=1)
 
         if mel_lens is not None:
-            mel_len_target = int(mel_lens.max().item())
+            # DataParallel splits the batch per-GPU; each replica would otherwise
+            # compute its own max length and outputs could not be gathered.
+            mel_len_target = int(target_len) if target_len is not None else int(mel_lens.max().item())
         else:
             rounded = torch.round(durations).clamp(min=1).long()
             mel_len_target = int(rounded.sum(dim=1).max().item())
