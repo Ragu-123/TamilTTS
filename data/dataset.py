@@ -6,8 +6,13 @@ High-Throughput Streaming Parquet Dataset for TamilTTSv2 (FastPitch / RAD-TTS St
 - Per-sample prosody features: utterance-normalized log-F0, voicing mask, log-energy.
 - Dynamic Batching & Collation: sequences padded only to the max length in the batch.
 - Fast row-group reads: only the consumed columns (the audio blob) are decoded,
-  and ParquetFile handles are reused — profiled 7.5x faster cold reads on the
-  AI4Bharat parquets, where 93% of __getitem__ wall time was row-group decoding.
+  and ParquetFile handles are reused.
+- RowGroupBatchSampler: composes each batch FROM A SINGLE parquet row group so
+  one ~160 MB group decode serves the whole batch (random access otherwise
+  re-decodes a full group per SAMPLE — profiled 1.3 s/sample, 93% of
+  __getitem__ wall time). Members are MFA-duration-sorted inside each group,
+  which also cuts decoder padding waste from ~55% (random batches) to ~4%.
+  Epochs still see every sample; the sampler shuffles groups and batch order.
 - Sample Rate: 22,050 Hz (exact match for pre-trained HiFi-GAN V1).
 """
 import glob
@@ -21,7 +26,7 @@ import pyarrow.parquet as pq
 import soundfile as sf
 import torch
 import torchaudio.functional as AF
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from data.audio_features import MelExtractor, extract_energy, extract_f0
 from preprocess.g2g import TAMIL_G2G_TOKENS, VOCAB_SIZE
@@ -343,15 +348,135 @@ def tamil_tts_collate_fn(batch):
 TamilTTSDataset = DirectParquetTamilDataset
 
 
+def build_row_group_batches(ds, batch_size, seed=42,
+                            super_chunk=2048, min_batch_frac=0.5, positions=None):
+    """Compose batches whose members all live in ONE parquet row group.
+
+    One row group of the AI4Bharat parquets is ~95 rows / ~160 MB compressed.
+    Decoding it is the dominant __getitem__ cost, so a batch drawn from one
+    group amortizes that decode across `batch_size` samples instead of paying
+    it once per sample. Members are length-sorted within each group so its
+    batches are near-uniform (~4% pad waste vs ~55% for random batches).
+
+    Args:
+        ds: DirectParquetTamilDataset (uses .index and .durations_dict).
+        batch_size: target batch size; tail batches may be smaller.
+        seed: shuffling seed for reproducibility.
+        super_chunk: number of duration-sorted samples per mixing window;
+            larger = tighter global length homogeneity across neighbors.
+        min_batch_frac: drop tail batches smaller than this fraction of the
+            target size (they would only add an unrepresentative step).
+        positions: optional iterable restricting composition to these dataset
+            positions (e.g. a Subset's indices). Batches are returned in the
+            SAME position space as given here (dataset positions), not remapped.
+    Returns:
+        List[List[int]]: batches of positional indices into ds.index order.
+    """
+    positions = set(positions) if positions is not None else None
+    len_of = {}
+    file_rg_of = {}
+    for i, (f, rg_idx, _row, key) in enumerate(ds.index):
+        if positions is not None and i not in positions:
+            continue
+        file_rg_of[i] = (f, rg_idx)
+        entry = ds.durations_dict.get(key)
+        if entry is not None and entry.get("durations"):
+            len_of[i] = int(round(sum(entry["durations"])))
+
+    pool = [i for i in range(len(ds)) if i in len_of]
+    if not pool:
+        raise RuntimeError("No samples with MFA durations to build row-group batches.")
+
+    rng = random.Random(seed)
+    pool.sort(key=lambda i: len_of[i])  # global length sort
+
+    # Group positions by (file, row-group) inside each super-chunk.
+    batches = []
+    for s in range(0, len(pool), super_chunk):
+        chunk = pool[s:s + super_chunk]
+        rng.shuffle(chunk)
+        pools_by_rg = {}
+        for i in chunk:
+            pools_by_rg.setdefault(file_rg_of[i], []).append(i)
+
+        # Slice each row group's members into batches WITHIN the group, then
+        # shuffle batch order. A tiny remainder (< batch) may merge with the
+        # next group's remainder; those merged tail batches are filtered out
+        # below when they fall under min_batch_frac.
+        group_batches = []
+        for members in pools_by_rg.values():
+            members.sort(key=lambda i: len_of[i])
+            for s2 in range(0, len(members), batch_size):
+                group_batches.append(members[s2:s2 + batch_size])
+        rng.shuffle(group_batches)
+        batches.extend(group_batches)
+
+    batches = [b for b in batches
+               if len(b) >= max(1, int(round(batch_size * min_batch_frac)))]
+    return batches
+
+
+class RowGroupBatchSampler(Sampler):
+    """Yields pre-composed row-group-local batches; reshuffles every epoch.
+
+    Args:
+        ds: DirectParquetTamilDataset.
+        batch_size: target batch size (tail batches may be smaller).
+        indices: optional Subset.indices — composition is restricted to these
+            dataset positions and batches are remapped into SUBSET space
+            (DataLoader over a torch.utils.data.Subset expects subset indices).
+        rank/world_size: DDP sharding — each rank gets a disjoint interleave
+            of the composed batches; locality within a batch is preserved.
+        Remaining args are forwarded to build_row_group_batches.
+    """
+
+    def __init__(self, ds, batch_size, seed=42, super_chunk=2048,
+                 min_batch_frac=0.5, indices=None, rank=0, world_size=1):
+        if indices is not None:
+            # Compose over subset members only (dataset-position space), then
+            # remap to SUBSET space: DataLoader[Subset] expects subset indices.
+            pos_to_subset = {p: si for si, p in enumerate(indices)}
+            batches = build_row_group_batches(
+                ds, batch_size, seed=seed, super_chunk=super_chunk,
+                min_batch_frac=min_batch_frac, positions=set(indices),
+            )
+            batches = [[pos_to_subset[p] for p in b] for b in batches]
+        else:
+            batches = build_row_group_batches(
+                ds, batch_size, seed=seed, super_chunk=super_chunk,
+                min_batch_frac=min_batch_frac,
+            )
+        # DDP: interleave-shard so ranks see DISJOINT batch sets while every
+        # batch keeps its single-row-group locality. Across the 4 ranks an
+        # epoch still covers every composed batch exactly once.
+        self.batches = batches[rank::max(1, world_size)]
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        batches = list(self.batches)
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(batches)
+        self.epoch += 1
+        return iter(batches)
+
+    def __len__(self):
+        return len(self.batches)
+
+
 def build_tamil_datasets(dataset_dirs, cfg, val_split=0.02):
     """
     Build deterministic train and validation datasets from parquet directories.
-    Globbed recursively with a fixed seed-42 random split into Subsets.
+
+    The split is row-group aware: whole parquet row groups are assigned to train
+    or validation with a fixed seed, so batches stay single-row-group local
+    (required by RowGroupBatchSampler) and no utterance from a "seen" group
+    leaks into the validation set.
 
     Args:
         dataset_dirs (str | List[str]): Directories containing *.parquet files.
         cfg: Config object consumed by DirectParquetTamilDataset.
-        val_split (float): Fraction of samples held out for validation.
+        val_split (float): Fraction of row GROUPS held out for validation.
     Returns:
         Tuple[Subset, Subset]: (train_ds, val_ds).
     """
@@ -369,18 +494,25 @@ def build_tamil_datasets(dataset_dirs, cfg, val_split=0.02):
 
     full_ds = DirectParquetTamilDataset(parquet_files, cfg)
 
-    total_samples = len(full_ds)
-    val_size = max(int(total_samples * val_split), 20)
-    train_size = total_samples - val_size
+    # Split by row group identity (file, rg_idx) — never within a group.
+    groups = {}
+    for pos, (f, rg_idx, _row, _key) in enumerate(full_ds.index):
+        groups.setdefault((f, rg_idx), []).append(pos)
 
-    indices = list(range(total_samples))
+    group_ids = sorted(groups.keys())
     rng = random.Random(42)
-    rng.shuffle(indices)
+    rng.shuffle(group_ids)
 
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
+    n_groups_val = max(int(len(group_ids) * val_split), 1)
+    val_positions, train_positions = [], []
+    for gid in group_ids[:n_groups_val]:
+        val_positions.extend(groups[gid])
+    for gid in group_ids[n_groups_val:]:
+        train_positions.extend(groups[gid])
 
-    train_ds = torch.utils.data.Subset(full_ds, train_indices)
-    val_ds = torch.utils.data.Subset(full_ds, val_indices)
+    train_ds = torch.utils.data.Subset(full_ds, sorted(train_positions))
+    val_ds = torch.utils.data.Subset(full_ds, sorted(val_positions))
 
+    print(f"  ✓ Split: {len(train_positions):,} train / {len(val_positions):,} val "
+          f"({n_groups_val:,} of {len(group_ids):,} row groups held out)")
     return train_ds, val_ds

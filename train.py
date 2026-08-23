@@ -51,7 +51,7 @@ from losses import (
     SLMLoss,
 )
 from data import build_tamil_datasets
-from data.dataset import tamil_tts_collate_fn
+from data.dataset import tamil_tts_collate_fn, RowGroupBatchSampler
 from utils import (
     EMA,
     save_checkpoint,
@@ -456,21 +456,27 @@ def train_worker(local_rank, world_size, cfg):
     log(f"  Dataset             : {cfg.dataset_dir}", local_rank)
     train_ds, val_ds = build_tamil_datasets(cfg.dataset_dir, cfg)
 
-    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=local_rank, shuffle=False) if is_distributed else None
-
     use_workers = cfg.num_workers > 0
+    # Row-group-local batches: one ~160 MB parquet group decode serves a whole
+    # batch (vs. per-sample re-decode with shuffled access — the dominant cost).
+    # DDP: rank/world_size shard the composed batches into disjoint sets.
+    train_batch_sampler = RowGroupBatchSampler(
+        train_ds, cfg.per_gpu_batch,
+        rank=local_rank if is_distributed else 0,
+        world_size=world_size if is_distributed else 1,
+    )
+    log(f"  RG-local batches    : {len(train_batch_sampler):,}/rank "
+        f"({len(train_batch_sampler) * world_size:,} total)", local_rank)
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.per_gpu_batch,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        batch_sampler=train_batch_sampler,
         collate_fn=tamil_tts_collate_fn,
         num_workers=cfg.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
         prefetch_factor=getattr(cfg, "prefetch_factor", 4) if use_workers else None,
-        drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
@@ -478,7 +484,7 @@ def train_worker(local_rank, world_size, cfg):
         shuffle=False,
         sampler=val_sampler,
         collate_fn=tamil_tts_collate_fn,
-        num_workers=cfg.num_workers,
+        num_workers=min(2, cfg.num_workers),
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_workers,
         prefetch_factor=getattr(cfg, "prefetch_factor", 4) if use_workers else None,
@@ -523,8 +529,6 @@ def train_worker(local_rank, world_size, cfg):
             if global_step >= cfg.total_steps:
                 break
 
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
 
             pbar = tqdm(
                 enumerate(train_loader), total=batches_per_gpu,
