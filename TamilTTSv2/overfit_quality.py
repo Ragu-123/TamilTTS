@@ -2,15 +2,18 @@
 Overfit quality test: train a small set of real Tamil clips until synthesized
 audio is intelligible. Use this to find the step count that gives good audio.
 
+Uses ALL visible GPUs via DataParallel; per-GPU batch stays fixed so total
+throughput scales with GPU count.
+
 Validated recipe (from Kaggle iteration experiments):
   - style_dropout = 0.0 (dropout raised the mel floor and blurred mels)
   - warmup + cosine decay (constant LR caused loss spikes)
-  - honest FULL-set eval logging (per-batch prints were misleading)
+  - honest FULL-set eval logging
   - reference conditioning from a DIFFERENT clip (matches training distribution)
 
 Usage:
   python overfit_quality.py --steps 8000
-  python overfit_quality.py --steps 12000 --n_samples 20
+  python overfit_quality.py --steps 12000 --per_gpu_batch 8
 
 Outputs -> /kaggle/working/ttsv2_overfit_quality/
   model_overfit.pt, s{i}_original.wav, s{i}_teacherforced.wav, s{i}_freerun.wav, texts.txt
@@ -28,7 +31,9 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from config import Config
 from data import build_tamil_datasets
@@ -45,7 +50,30 @@ def decode_tokens(ids):
     )
 
 
-def pick_clips(train_ds, n_samples):
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=8000)
+    ap.add_argument("--n_samples", type=int, default=20)
+    ap.add_argument("--per_gpu_batch", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--out", type=str, default="/kaggle/working/ttsv2_overfit_quality")
+    args = ap.parse_args()
+
+    cfg = Config()
+    ngpu = torch.cuda.device_count()
+    device = "cuda"
+    use_dp = ngpu > 1
+    print(f"[0] GPUs: {ngpu} x {torch.cuda.get_device_name(0)} | "
+          f"mode: {'DataParallel' if use_dp else 'single'} | "
+          f"total batch = {args.per_gpu_batch} x {ngpu}", flush=True)
+
+    outd = args.out
+    os.makedirs(outd, exist_ok=True)
+    torch.manual_seed(1234)
+    t0 = time.time()
+
+    print("[1] loading dataset...", flush=True)
+    train_ds, _ = build_tamil_datasets(cfg.dataset_dir, cfg)
     picks = []
     for i in range(0, min(len(train_ds), 20000), 25):
         try:
@@ -56,46 +84,42 @@ def pick_clips(train_ds, n_samples):
             continue
         if 2.0 < float(item[5]) / cfg.sample_rate < 8.0:
             picks.append(i)
-        if len(picks) >= n_samples:
+        if len(picks) >= args.n_samples:
             break
-    return picks
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=8000)
-    ap.add_argument("--n_samples", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--out", type=str, default="/kaggle/working/ttsv2_overfit_quality")
-    args = ap.parse_args()
-
-    global cfg
-    cfg = Config()
-    device = "cuda"
-    outd = args.out
-    os.makedirs(outd, exist_ok=True)
-    torch.manual_seed(1234)
-    t0 = time.time()
-
-    print("[1] loading dataset...", flush=True)
-    train_ds, _ = build_tamil_datasets(cfg.dataset_dir, cfg)
-    picks = pick_clips(train_ds, args.n_samples)
     items = [train_ds[p] for p in picks]
+
+    total_batch = args.per_gpu_batch * max(1, ngpu)
+    dup = picks * (total_batch // len(picks)) + picks[: total_batch % len(picks)] if picks else []
     batches = [
         b
         for b in DataLoader(
-            Subset(train_ds, picks), batch_size=args.batch_size, shuffle=False,
+            Subset(train_ds, dup), batch_size=total_batch, shuffle=False,
             collate_fn=tamil_tts_collate_fn,
         )
         if b is not None
     ]
-    print(f"[1] {len(items)} clips ({sum(1 for _ in batches)} batches) ({time.time()-t0:.0f}s)", flush=True)
+    print(f"[1] {len(items)} unique clips -> {len(batches)} batches of {total_batch} "
+          f"({time.time()-t0:.0f}s)", flush=True)
 
     model = TamilTTSv2(cfg).to(device)
-    model.train()
+    runner = nn.DataParallel(model) if use_dp else model
+    runner.train()
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     mel_fn, dur_fn, pe_fn = MelLoss(0.5, 1.0), DurationLoss(), PitchEnergyLoss()
+
+    def fwd(b, return_audio=False):
+        t = b["tokens"].to(device); tl = b["token_lens"].to(device)
+        m = b["mel"].to(device); ml = b["mel_lens"].to(device)
+        gd = b["gt_dur"].to(device); f0 = b["log_f0"].to(device)
+        vc = b["voiced"].to(device); en = b["energy"].to(device)
+        o = runner(t, tl, mel=m, mel_lens=ml, gt_dur=gd, gt_logf0=f0,
+                   voiced=vc, gt_energy=en,
+                   ref_mel=torch.roll(m, 1, dims=0), ref_mel_lens=torch.roll(ml, 1),
+                   style_dropout=0.0, return_audio=return_audio)
+        l1, _, _ = mel_fn(o["mel_pred"], o["mel_coarse"], m, mel_lens=ml)
+        ld = dur_fn(o["log_dur"], gd, token_lens=tl)
+        lf, le = pe_fn(o["log_f0"], o["energy"], f0, vc, en, mel_lens=ml)
+        return o, l1, ld, lf, le
 
     TOTAL, WARM = args.steps, min(500, max(100, args.steps // 20))
     PEAK = args.lr
@@ -108,54 +132,46 @@ def main():
 
     @torch.no_grad()
     def full_eval():
-        was_training = model.training
-        model.eval()
+        was_training = runner.training
+        runner.eval()
         vals = []
         for b in batches:
-            t = b["tokens"].to(device); tl = b["token_lens"].to(device)
-            m = b["mel"].to(device); ml = b["mel_lens"].to(device)
-            gd = b["gt_dur"].to(device); f0 = b["log_f0"].to(device)
-            vc = b["voiced"].to(device); en = b["energy"].to(device)
-            o = model(t, tl, mel=m, mel_lens=ml, gt_dur=gd, gt_logf0=f0,
-                      voiced=vc, gt_energy=en,
-                      ref_mel=torch.roll(m, 1, dims=0), ref_mel_lens=torch.roll(ml, 1),
-                      style_dropout=0.0, return_audio=False)
-            l1, _, _ = mel_fn(o["mel_pred"], o["mel_coarse"], m, mel_lens=ml)
+            _, l1, _, _, _ = fwd(b)
             vals.append(l1.item())
         if was_training:
-            model.train()
+            runner.train()
         return sum(vals) / len(vals)
 
     print(f"[2] training {TOTAL} steps (warmup {WARM}) ...", flush=True)
     rng = random.Random(7)
     order = list(range(len(batches)))
-    log_every = max(250, TOTAL // 12)
-    for step in range(1, TOTAL + 1):
+    eval_every = max(250, TOTAL // 12)
+    pbar = tqdm(range(1, TOTAL + 1), desc="overfit", unit="step",
+                dynamic_ncols=True, smoothing=0.1)
+    last = {"mel": 0.0, "dur": 0.0, "full": float("nan")}
+    for step in pbar:
         if (step - 1) % len(batches) == 0:
             rng.shuffle(order)
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
-        b = batches[order[(step - 1) % len(batches)]]
-        t = b["tokens"].to(device); tl = b["token_lens"].to(device)
-        m = b["mel"].to(device); ml = b["mel_lens"].to(device)
-        gd = b["gt_dur"].to(device); f0 = b["log_f0"].to(device)
-        vc = b["voiced"].to(device); en = b["energy"].to(device)
-        o = model(t, tl, mel=m, mel_lens=ml, gt_dur=gd, gt_logf0=f0,
-                  voiced=vc, gt_energy=en,
-                  ref_mel=torch.roll(m, 1, dims=0), ref_mel_lens=torch.roll(ml, 1),
-                  style_dropout=0.0, return_audio=False)
-        l1, _, _ = mel_fn(o["mel_pred"], o["mel_coarse"], m, mel_lens=ml)
-        ld = dur_fn(o["log_dur"], gd, token_lens=tl)
-        lf, le = pe_fn(o["log_f0"], o["energy"], f0, vc, en, mel_lens=ml)
+        o, l1, ld, lf, le = fwd(batches[order[(step - 1) % len(batches)]])
         loss = l1 + ld + lf + le
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], 0.5)
         opt.step()
-        if step % log_every == 0 or step == TOTAL:
-            print(f"[2] step {step} | FULL mel {full_eval():.4f} | "
-                  f"lr {lr_at(step):.2e} | {time.time()-t0:.0f}s", flush=True)
+        last["mel"], last["dur"] = l1.item(), ld.item()
+        if step % eval_every == 0 or step == TOTAL:
+            last["full"] = full_eval()
+        pbar.set_postfix({
+            "mel": f"{last['mel']:.3f}",
+            "dur": f"{last['dur']:.3f}",
+            "FULL_mel": f"{last['full']:.4f}",
+            "lr": f"{lr_at(step):.1e}",
+            "s": f"{time.time()-t0:.0f}",
+        })
+    pbar.close()
 
     torch.save({"model_state_dict": model.state_dict()}, f"{outd}/model_overfit.pt")
     print("[3] checkpoint saved", flush=True)
