@@ -171,9 +171,10 @@ class DiscriminatorLoss(nn.Module):
 
     def forward(self, scores_real, scores_fake):
         if not len(scores_real) and not len(scores_fake):
-            return torch.zeros((), device="cpu")
-        d_real = torch.stack([((s.float() - 1.0) ** 2).mean() for s in scores_real]).mean()
-        d_fake = torch.stack([(s.float() ** 2).mean() for s in scores_fake]).mean()
+            return torch.zeros((), device="cuda" if torch.cuda.is_available() else "cpu")
+        dev = scores_real[0].device if len(scores_real) else scores_fake[0].device
+        d_real = torch.stack([((s.float() - 1.0) ** 2).mean() for s in scores_real]).mean() if len(scores_real) else torch.zeros((), device=dev)
+        d_fake = torch.stack([(s.float() ** 2).mean() for s in scores_fake]).mean() if len(scores_fake) else torch.zeros((), device=dev)
         return d_real + d_fake
 
 
@@ -182,7 +183,7 @@ class GeneratorAdversarialLoss(nn.Module):
 
     def forward(self, scores_fake):
         if not len(scores_fake):
-            return torch.zeros((), device="cpu")
+            return torch.zeros((), device="cuda" if torch.cuda.is_available() else "cpu")
         return sum(((s.float() - 1.0) ** 2).mean() for s in scores_fake)
 
 
@@ -210,7 +211,8 @@ class FeatureMatchingLoss(nn.Module):
             if layer_losses:
                 disc_losses.append(torch.stack(layer_losses).mean())
         if not disc_losses:
-            return torch.zeros((), device="cpu")
+            dev = feats_fake[0][0].device if len(feats_fake) and len(feats_fake[0]) else ("cuda" if torch.cuda.is_available() else "cpu")
+            return torch.zeros((), device=dev)
         return torch.stack(disc_losses).mean()
 
 

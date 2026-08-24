@@ -98,8 +98,7 @@ def tokens_with_sil(text, valid_set):
 
     THE canonical inference-side tokenizer. Matches the MFA training convention:
     every utterance starts/ends with 'sil' and pause punctuation inserts 'sil'
-    between clauses. Inference sequences therefore come from the same distribution
-    the duration/pitch heads and decoder were trained on.
+    between clauses. Consecutive silences are collapsed.
 
     Args:
         text (str): Raw Tamil text.
@@ -119,8 +118,9 @@ def tokens_with_sil(text, valid_set):
         if ch in PUNCT_SET:  # whitespace / quotes — no sil, just skipped
             i += 1
             continue
-        if pending_pause and len(out) > 1:
-            out.append("sil")
+        if pending_pause:
+            if out and out[-1] != "sil":
+                out.append("sil")
             pending_pause = False
         matched = False
         for l in [3, 2, 1]:
@@ -131,8 +131,17 @@ def tokens_with_sil(text, valid_set):
                 matched = True
                 break
         if not matched:
-            out.append(ch)
+            if ch in valid_set:
+                out.append(ch)
+            else:
+                out.append("<unk>")
             i += 1
-    if len(out) > 1:
+    if not out or out[-1] != "sil":
         out.append("sil")
-    return out
+
+    clean_out = []
+    for t in out:
+        if t == "sil" and clean_out and clean_out[-1] == "sil":
+            continue
+        clean_out.append(t)
+    return clean_out

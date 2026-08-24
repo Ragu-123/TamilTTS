@@ -120,10 +120,10 @@ class TamilTTSv2(nn.Module):
         if gt_dur is not None and mel_lens is not None:
             # DataParallel splits the batch per-GPU; each replica would otherwise
             # compute its own max length and outputs could not be gathered.
-            mel_len_target = int(target_len) if target_len is not None else int(mel_lens.max().item())
+            mel_len_target = max(16, int(target_len) if target_len is not None else int(mel_lens.max().item()))
             mel_mask = ~sequence_mask(mel_lens, mel_len_target)
         else:
-            mel_len_target = int(target_len) if target_len is not None else int(out_lens.max().item())
+            mel_len_target = max(16, int(target_len) if target_len is not None else int(out_lens.max().item()))
             mel_mask = ~sequence_mask(out_lens, mel_len_target)
 
         expanded = length_regulate(x, durations, mel_len_target)      # [B, Tm, H]
