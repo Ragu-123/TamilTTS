@@ -424,13 +424,31 @@ def train_worker(local_rank, world_size, cfg):
 
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-        mpd = DDP(mpd, device_ids=[local_rank])
-        mrd = DDP(mrd, device_ids=[local_rank])
-        log(f"  🔥 DDP Active       : {world_size} GPUs (Rank {local_rank} on cuda:{local_rank})", local_rank)
+        # Discriminators are NOT DDP-wrapped: the GAN loop backprops through them
+        # twice per step (D update, then the generator's adversarial loss). Under
+        # DDP that fires a second, rank-desynced round of gradient all-reduces on
+        # D and deadlocks NCCL (watchdog kill at stage1_steps). Instead we keep
+        # raw modules and manually average their grads across ranks before
+        # opt_d.step() — same math as HiFi-GAN's DataParallel recipe.
+        log(f"  🔥 DDP Active       : {world_size} GPUs (Rank {local_rank} on cuda:{local_rank}) "
+            f"| discriminators: manual grad-averaging", local_rank)
     else:
         log(f"  🚀 Device Active    : {device}", local_rank)
 
     net = unwrap_model(model)
+
+    def average_disc_grads():
+        """All-reduce discriminator grads so every rank steps identical D weights."""
+        if not is_distributed:
+            return
+        grads = [p.grad for p in disc_params if p.grad is not None]
+        if not grads:
+            return
+        coalesced = torch._utils._flatten_dense_tensors(grads)
+        dist.all_reduce(coalesced, op=dist.ReduceOp.SUM)
+        coalesced /= world_size
+        for buf, grad in zip(torch._utils._unflatten_dense_tensors(coalesced, grads), grads):
+            grad.copy_(buf)
 
     acoustic_params = [p for p in model.parameters() if p.requires_grad]
     disc_params = list(mpd.parameters()) + list(mrd.parameters())
@@ -595,6 +613,7 @@ def train_worker(local_rank, world_size, cfg):
 
                         opt_d.zero_grad(set_to_none=True)
                         d_loss.backward()
+                        average_disc_grads()  # ranks must agree before ANY of them steps
                         d_norm = torch.nn.utils.clip_grad_norm_(disc_params, cfg.max_grad_norm)
                         if torch.isfinite(d_norm):
                             opt_d.step()
