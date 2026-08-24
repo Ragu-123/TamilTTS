@@ -133,31 +133,35 @@ def run_discriminators(mpd, mrd, audio):
     return scores, feats
 
 
-def crop_audio_pairs(real_audio, fake_audio, audio_lens, min_seg=8192):
-    """Per-sample matched crops with ZERO padding exposure.
+def make_gan_segments(vocoder, mel_pred, mel_lens, real_audio, hop_length, seg_frames=32):
+    """HiFi-GAN-style matched segment sampling (bounds GAN-stage memory).
 
-    For each sample i, pick one random window of length L_i = clamp(audio_lens[i],
-    min_seg, max_seg) and apply the SAME window to the real and generated waveform,
-    so the discriminators / SLM compare aligned content instead of collate
-    zero-padding vs. generated tail (the previous min-of-padded-lengths behavior).
+    Picks one random `seg_frames` window per sample from the PREDICTED mel
+    (bounded by each sample's true mel_len, so zero padding enters), vocodes
+    ONLY that window with grad flowing back to mel_pred, and cuts the REAL
+    waveform at the aligned sample offset. Peak memory is capped at
+    seg_frames*hop = 8192 samples regardless of utterance length — vocoding
+    full padded sequences (B x up-to-10s audio through 256x upsampling)
+    exceeded 22GB at the first GAN step and killed a rank, deadlocking the
+    rest on the next collective.
 
-    Returns (real_seg [B, Lmax], fake_seg [B, Lmax], seg_lens [B]).
+    Returns (real_seg [B, seg_frames*hop], fake_seg [B, seg_frames*hop]).
     """
-    B = real_audio.size(0)
-    device = real_audio.device
-    max_len = real_audio.size(-1)
-    lens = torch.minimum(audio_lens.to(device).clamp(max=min_seg), torch.full_like(audio_lens, max_len))
-    lens = lens.clamp(min=1)
+    B = mel_pred.size(0)
+    device = mel_pred.device
+    lens = mel_lens.to(device).clamp(min=seg_frames)
+    starts = (torch.rand(B, device=device) * (lens - seg_frames + 1)).floor().long()
 
-    seg_real = real_audio.new_zeros(B, int(lens.max().item()))
-    seg_fake = fake_audio.new_zeros(B, seg_real.size(1))
-    for i in range(B):
-        L = int(lens[i].item())
-        start = int(torch.randint(0, max(1, int(audio_lens[i]) - L + 1), ()).item()) \
-            if int(audio_lens[i]) > L else 0
-        seg_real[i, :L] = real_audio[i, start:start + L]
-        seg_fake[i, :L] = fake_audio[i, start:start + L]
-    return seg_real, seg_fake, lens
+    mel_t = mel_pred.transpose(1, 2)                     # [B, 80, Tm]
+    idx_m = starts.view(B, 1, 1) + torch.arange(seg_frames, device=device).view(1, 1, -1)
+    mel_win = mel_t.gather(2, idx_m.expand(-1, mel_t.size(1), -1))      # [B, 80, L]
+
+    La = seg_frames * hop_length
+    idx_a = (starts * hop_length).view(B, 1) + torch.arange(La, device=device).view(1, -1)
+    real_seg = real_audio.gather(1, idx_a)               # [B, La]
+
+    fake_seg = vocoder(mel_win)                          # [B, La], grad -> mel_pred
+    return real_seg.float(), fake_seg.float()
 
 
 def slm_weight(step, cfg):
@@ -570,6 +574,11 @@ def train_worker(local_rank, world_size, cfg):
                 cur_slm_w = slm_weight(global_step, cfg)
 
                 with amp_context(device, cfg):
+                    # The vocoder is NOT run on full utterances during training:
+                    # make_gan_segments vocodes a random 32-frame window per
+                    # sample instead (constant ~8k samples of audio per batch,
+                    # vs. up to 10s x B through 256x upsampling that OOMed an
+                    # L4 at the first GAN step).
                     out = model(
                         batch["tokens"], batch["token_lens"],
                         mel=batch["mel"], mel_lens=batch["mel_lens"],
@@ -578,7 +587,7 @@ def train_worker(local_rank, world_size, cfg):
                         gt_energy=batch["energy"],
                         ref_mel=ref_mel, ref_mel_lens=ref_mel_lens,
                         style_dropout=cfg.style_dropout_p,
-                        return_audio=gan_active,
+                        return_audio=False,
                     )
 
                     loss_mel, l_ref, l_crs = mel_loss_fn(
@@ -600,11 +609,12 @@ def train_worker(local_rank, world_size, cfg):
                     )
 
                     d_loss_val = adv_val = fm_val = 0.0
-                    gen_audio = out.get("gen_audio") if isinstance(out, dict) else None
 
-                    if gan_active and gen_audio is not None:
-                        real_cut, fake_cut, seg_lens = crop_audio_pairs(
-                            batch["audio"], gen_audio, batch["audio_lens"]
+                    if gan_active:
+                        net_vocoder = net.vocoder
+                        real_cut, fake_cut = make_gan_segments(
+                            net_vocoder, out["mel_pred"].float(), batch["mel_lens"],
+                            batch["audio"], hop_length=cfg.hop_length,
                         )
 
                         scores_real, feats_real = run_discriminators(mpd, mrd, real_cut)
