@@ -44,18 +44,41 @@ class MelLoss(nn.Module):
     """
     Masked Dual Mel-Spectrogram Loss.
     Targets are the normalized [B, 80, Tm] mel transposed to [B, Tm, 80].
+    `lowband_w` multiplies the L1 on the lowest `lowband_bins` mel bins: measured
+    +0.46 low-frequency bias (drone) in trained models needs extra pressure there.
     Returns (weighted_total, l_refined, l_coarse).
     """
 
-    def __init__(self, coarse_w=0.5, refined_w=1.0):
+    def __init__(self, coarse_w=0.5, refined_w=1.0, lowband_w=1.0, lowband_bins=10):
         super().__init__()
         self.coarse_w = coarse_w
         self.refined_w = refined_w
+        self.lowband_w = lowband_w
+        self.lowband_bins = lowband_bins
+
+    def _masked_l1_binned(self, pred, target, lens):
+        """Per-bin masked L1: [B, Tm, 80] -> [80]."""
+        min_t = min(pred.size(1), target.size(1))
+        pred = pred[:, :min_t]
+        target = target[:, :min_t]
+        loss = F.l1_loss(pred.float(), target.float(), reduction="none")  # [B,Tm,80]
+        if lens is None:
+            return loss.mean(dim=(0, 1))
+        lens = lens.to(loss.device).long()
+        mask = (torch.arange(min_t, device=loss.device).unsqueeze(0) < lens.unsqueeze(1)).float()
+        denom = torch.clamp(mask.sum(), min=1.0)
+        return (loss * mask.unsqueeze(-1)).sum(dim=(0, 1)) / denom
 
     def forward(self, mel_pred, mel_coarse, mel_target, mel_lens=None):
         target = mel_target.transpose(1, 2)
-        l_refined = masked_l1(mel_pred, target, mel_lens)
-        l_coarse = masked_l1(mel_coarse, target, mel_lens)
+        # per-bin losses enable targeted low-band weighting
+        bins_ref = self._masked_l1_binned(mel_pred, target, mel_lens)
+        bins_crs = self._masked_l1_binned(mel_coarse, target, mel_lens)
+        w = torch.ones_like(bins_ref)
+        if self.lowband_w != 1.0:
+            w[:self.lowband_bins] = self.lowband_w
+        l_refined = (bins_ref * w).mean()
+        l_coarse = (bins_crs * w).mean()
         total = self.refined_w * l_refined + self.coarse_w * l_coarse
         return total, l_refined, l_coarse
 

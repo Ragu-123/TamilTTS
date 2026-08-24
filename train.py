@@ -473,7 +473,8 @@ def train_worker(local_rank, world_size, cfg):
     sched_g = get_lr_scheduler(opt_g, cfg.warmup_steps, cfg.total_steps)
     opt_d = torch.optim.AdamW(disc_params, lr=cfg.disc_lr, betas=(0.8, 0.99), eps=1e-8)
 
-    mel_loss_fn = MelLoss(coarse_w=cfg.weight_mel_coarse, refined_w=cfg.weight_mel_refined)
+    mel_loss_fn = MelLoss(coarse_w=cfg.weight_mel_coarse, refined_w=cfg.weight_mel_refined,
+                          lowband_w=getattr(cfg, "weight_mel_lowband", 1.0))
     dur_loss_fn = DurationLoss()
     pe_loss_fn = PitchEnergyLoss()
     disc_loss_fn = DiscriminatorLoss()

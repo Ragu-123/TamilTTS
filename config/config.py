@@ -50,7 +50,7 @@ class Config:
     num_workers      = 8
     prefetch_factor  = 4
     learning_rate    = 1.5e-4
-    disc_lr          = 1e-4
+    disc_lr          = 3e-5   # was 1e-4: D dominated (d_loss ~0.05, adv flat for 17k steps)
     weight_decay     = 0.01
     warmup_steps     = 3_000
     save_every       = 2_000
@@ -65,9 +65,11 @@ class Config:
     weight_dur         = 1.0
     weight_f0          = 1.0
     weight_energy      = 1.0
-    weight_adv         = 1.0
+    weight_adv         = 2.0   # was 1.0: amplify adversarial gradient (D-dominance fix)
     weight_fm          = 1.0
     weight_slm_final   = 0.1
+    weight_mel_lowband = 2.0   # extra L1 weight on lowest 10 mel bins: counters measured
+                               # +0.46 low-freq bias (the "mosquito drone")
 
     # --- Staged Training Schedule ---
     stage1_steps     = 25_000
