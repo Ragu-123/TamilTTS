@@ -23,9 +23,11 @@ class PeriodDiscriminator(nn.Module):
 
     def forward(self, x):
         """
-        x: [B, T] audio
+        x: [B, T] or [B, 1, T] audio
         Returns (score [B,1,T'], feat_list).
         """
+        if x.dim() == 3:
+            x = x.squeeze(1)
         feat_list = []
         B, T = x.shape
         pad = (self.period - (T % self.period)) % self.period
@@ -51,9 +53,11 @@ class MultiPeriodDiscriminator(nn.Module):
 
     def forward(self, audio):
         """
-        audio: [B, T]
+        audio: [B, T] or [B, 1, T]
         Returns (scores: list of [B,1,T'], feat_lists: list of list[Tensor]).
         """
+        if audio.dim() == 3:
+            audio = audio.squeeze(1)
         scores, feat_lists = [], []
         for disc in self.discriminators:
             score, feats = disc(audio)
@@ -85,9 +89,11 @@ class ResDiscriminator(nn.Module):
 
     def forward(self, audio):
         """
-        audio: [B, T]
+        audio: [B, T] or [B, 1, T]
         Returns (score, feat_list).
         """
+        if audio.dim() == 3:
+            audio = audio.squeeze(1)
         x = torch.stft(
             audio.float(),
             n_fft=self.n_fft,
