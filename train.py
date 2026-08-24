@@ -153,10 +153,10 @@ def make_gan_segments(vocoder, mel_pred, mel_lens, real_audio, hop_length, seg_f
     # frames), so window starts are bounded by BOTH axes; otherwise the audio
     # gather can read past the padded waveform -> CUDA device assert.
     lens = mel_lens.to(device).clamp(min=seg_frames)
-    max_start = ((real_audio.size(-1) - seg_frames * hop_length) // hop_length).clamp(min=0)
-    lens = torch.minimum(lens, max_start + seg_frames).clamp(min=seg_frames)
+    max_start = max(0, (real_audio.size(-1) - seg_frames * hop_length) // hop_length)
+    lens = torch.minimum(lens, torch.full_like(lens, max_start + seg_frames)).clamp(min=seg_frames)
     starts = (torch.rand(B, device=device) * (lens - seg_frames + 1)).floor().long()
-    starts = torch.minimum(starts, max_start)
+    starts = torch.minimum(starts, torch.full_like(starts, max_start))
 
     mel_t = mel_pred.transpose(1, 2)                     # [B, 80, Tm]
     idx_m = starts.view(B, 1, 1) + torch.arange(seg_frames, device=device).view(1, 1, -1)
@@ -164,6 +164,9 @@ def make_gan_segments(vocoder, mel_pred, mel_lens, real_audio, hop_length, seg_f
 
     La = seg_frames * hop_length
     idx_a = (starts * hop_length).view(B, 1) + torch.arange(La, device=device).view(1, -1)
+    # clamp guards clips shorter than one window (start=0 still overruns); the
+    # repeated tail values act as zero-amplitude-ish padding for those rare rows.
+    idx_a = idx_a.clamp(max=real_audio.size(1) - 1)
     real_seg = real_audio.gather(1, idx_a)               # [B, La]
 
     fake_seg = vocoder(mel_win)                          # [B, La], grad -> mel_pred
