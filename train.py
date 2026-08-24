@@ -149,8 +149,14 @@ def make_gan_segments(vocoder, mel_pred, mel_lens, real_audio, hop_length, seg_f
     """
     B = mel_pred.size(0)
     device = mel_pred.device
+    # A clip's mel frame count can exceed audio_len/hop (center-pad framing adds
+    # frames), so window starts are bounded by BOTH axes; otherwise the audio
+    # gather can read past the padded waveform -> CUDA device assert.
     lens = mel_lens.to(device).clamp(min=seg_frames)
+    max_start = ((real_audio.size(-1) - seg_frames * hop_length) // hop_length).clamp(min=0)
+    lens = torch.minimum(lens, max_start + seg_frames).clamp(min=seg_frames)
     starts = (torch.rand(B, device=device) * (lens - seg_frames + 1)).floor().long()
+    starts = torch.minimum(starts, max_start)
 
     mel_t = mel_pred.transpose(1, 2)                     # [B, 80, Tm]
     idx_m = starts.view(B, 1, 1) + torch.arange(seg_frames, device=device).view(1, 1, -1)
