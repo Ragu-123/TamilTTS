@@ -67,34 +67,40 @@ class EnergyHead(VariancePredictor):
 
 
 class PitchEmbedder(nn.Module):
-    """Embed log-F0 contour into hidden space via small Conv1d stack."""
-    def __init__(self, hidden_dim):
+    """Embed log-F0 contour into hidden space with LayerNorm and bounded scale."""
+    def __init__(self, hidden_dim, scale=0.2):
         super().__init__()
+        self.scale = scale
         self.net = nn.Sequential(
             nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, logf0):
         """
         logf0: [B, T] -> [B, T, hidden_dim]
         """
-        return self.net(logf0.unsqueeze(1)).transpose(1, 2)
+        emb = self.net(logf0.unsqueeze(1)).transpose(1, 2)
+        return torch.tanh(self.norm(emb)) * self.scale
 
 
 class EnergyEmbedder(nn.Module):
-    """Embed log-energy contour into hidden space (same wire as PitchEmbedder)."""
-    def __init__(self, hidden_dim):
+    """Embed log-energy contour into hidden space with LayerNorm and bounded scale."""
+    def __init__(self, hidden_dim, scale=0.2):
         super().__init__()
+        self.scale = scale
         self.net = nn.Sequential(
             nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, energy):
         """
         energy: [B, T] -> [B, T, hidden_dim]
         """
-        return self.net(energy.unsqueeze(1)).transpose(1, 2)
+        emb = self.net(energy.unsqueeze(1)).transpose(1, 2)
+        return torch.tanh(self.norm(emb)) * self.scale

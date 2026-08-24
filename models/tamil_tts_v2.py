@@ -114,20 +114,19 @@ class TamilTTSv2(nn.Module):
         else:
             durations = torch.round(dur_pred).clamp(min=1)
 
-        if mel_lens is not None:
+        rounded = torch.round(durations).clamp(min=1).long()
+        out_lens = rounded.sum(dim=1)
+
+        if gt_dur is not None and mel_lens is not None:
             # DataParallel splits the batch per-GPU; each replica would otherwise
             # compute its own max length and outputs could not be gathered.
             mel_len_target = int(target_len) if target_len is not None else int(mel_lens.max().item())
-        else:
-            rounded = torch.round(durations).clamp(min=1).long()
-            mel_len_target = int(rounded.sum(dim=1).max().item())
-
-        expanded = length_regulate(x, durations, mel_len_target)      # [B, Tm, H]
-
-        if mel_lens is not None:
             mel_mask = ~sequence_mask(mel_lens, mel_len_target)
         else:
-            mel_mask = torch.zeros(B, mel_len_target, dtype=torch.bool, device=device)
+            mel_len_target = int(target_len) if target_len is not None else int(out_lens.max().item())
+            mel_mask = ~sequence_mask(out_lens, mel_len_target)
+
+        expanded = length_regulate(x, durations, mel_len_target)      # [B, Tm, H]
 
         # 6. Pitch conditioning
         pred_logf0 = self.pitch_head(expanded, mel_mask)              # [B, Tm]

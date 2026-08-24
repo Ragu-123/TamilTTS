@@ -286,7 +286,7 @@ def synthesize_samples(net, ema, val_loader, device, cfg, step):
         with amp_context(device, cfg):
             out = net(
                 tokens, token_lens,
-                mel=mel, mel_lens=mel_lens,
+                mel=None, mel_lens=None,
                 gt_dur=None,
                 ref_mel=ref_mel, ref_mel_lens=ref_mel_lens,
                 return_audio=True,
@@ -313,7 +313,9 @@ def evaluate(model, val_loader, device, cfg, srfd_bundle=None, local_rank=0):
     net = unwrap_model(model)
     was_training = net.training
     net.eval()
-    mel_fn = MelLoss(coarse_w=cfg.weight_mel_coarse, refined_w=cfg.weight_mel_refined)
+    mel_fn = MelLoss(coarse_w=cfg.weight_mel_coarse, refined_w=cfg.weight_mel_refined,
+                     sc_w=getattr(cfg, "weight_sc", 1.0),
+                     lowband_w=getattr(cfg, "weight_mel_lowband", 1.0))
 
     total_mel = 0.0
     total_srfd = 0.0
@@ -474,6 +476,7 @@ def train_worker(local_rank, world_size, cfg):
     opt_d = torch.optim.AdamW(disc_params, lr=cfg.disc_lr, betas=(0.8, 0.99), eps=1e-8)
 
     mel_loss_fn = MelLoss(coarse_w=cfg.weight_mel_coarse, refined_w=cfg.weight_mel_refined,
+                          sc_w=getattr(cfg, "weight_sc", 1.0),
                           lowband_w=getattr(cfg, "weight_mel_lowband", 1.0))
     dur_loss_fn = DurationLoss()
     pe_loss_fn = PitchEnergyLoss()

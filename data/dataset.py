@@ -38,6 +38,62 @@ def build_tamil_vocab():
     return char2id, VOCAB_SIZE
 
 
+def regularize_durations(toks, durs, mel_len):
+    """
+    Smooth pathological 1-frame spikes in MFA durations while strictly preserving sum == mel_len.
+    - Pauses/silence: minimum 6 frames (~70ms)
+    - Virama/pure consonants: minimum 2 frames (~23ms)
+    - Syllable aksharas/vowels: minimum 3 frames (~35ms)
+    - Proportional redistribution of excess duration mass from 50+ frame spikes.
+    """
+    durs = [float(d) for d in durs]
+    n = len(toks)
+    if n == 0 or mel_len < n:
+        return [max(1.0, float(mel_len) / max(1, n))] * n
+
+    floors = []
+    for t in toks:
+        if t == "sil":
+            floors.append(6.0)
+        elif any(c in t for c in ["்", "க்", "ங்", "ச்", "ஞ்", "ட்", "ண்", "த்", "ந்", "ப்", "ம்", "ய்", "ர்", "ல்", "வ்", "ழ்", "ள்", "ற்", "ன்"]):
+            floors.append(2.0)
+        else:
+            floors.append(3.0)
+
+    floor_sum = sum(floors)
+    if floor_sum > mel_len:
+        scale = mel_len / float(floor_sum)
+        floors = [max(1.0, f * scale) for f in floors]
+
+    adjusted = [max(d, f) for d, f in zip(durs, floors)]
+    cur_sum = sum(adjusted)
+
+    diff = cur_sum - mel_len
+    if diff > 0:
+        excess = [max(0.0, a - f) for a, f in zip(adjusted, floors)]
+        total_excess = sum(excess)
+        if total_excess > 0:
+            for i in range(n):
+                sub = (excess[i] / total_excess) * diff
+                adjusted[i] = max(floors[i], adjusted[i] - sub)
+    elif diff < 0:
+        add_total = abs(diff)
+        w_sum = sum(adjusted)
+        for i in range(n):
+            adjusted[i] += (adjusted[i] / max(w_sum, 1.0)) * add_total
+
+    rounded = [int(round(a)) for a in adjusted]
+    for i in range(n):
+        rounded[i] = max(1, rounded[i])
+    r_sum = sum(rounded)
+    r_diff = mel_len - r_sum
+    if r_diff != 0:
+        target_i = int(np.argmax(rounded))
+        rounded[target_i] = max(1, rounded[target_i] + r_diff)
+
+    return [float(r) for r in rounded]
+
+
 class DirectParquetTamilDataset(Dataset):
     """
     Row-Group Level Streaming Parquet Dataset for Tamil TTS with 100% MFA Ground Truth.
@@ -249,8 +305,8 @@ class DirectParquetTamilDataset(Dataset):
                 dur_sum = int(round(gt_dur.sum().item()))
                 diff = mel_len - dur_sum
                 if abs(diff) <= max(10, int(0.05 * mel_len)):
-                    target_idx = -1 if gt_dur[-1] >= gt_dur[0] else 0
-                    gt_dur[target_idx] = max(1.0, gt_dur[target_idx].item() + diff)
+                    smooth_durs = regularize_durations(toks, durs, mel_len)
+                    gt_dur = torch.tensor(smooth_durs, dtype=torch.float32)
                 else:
                     self._register_failure()
                     consecutive_failures += 1

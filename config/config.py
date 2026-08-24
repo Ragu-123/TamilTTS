@@ -70,6 +70,8 @@ class Config:
     weight_slm_final   = 0.1
     weight_mel_lowband = 2.0   # extra L1 weight on lowest 10 mel bins: counters measured
                                # +0.46 low-freq bias (the "mosquito drone")
+    weight_sc          = 1.0   # Spectral Convergence: forces sharp harmonic peaks & penalizes mel blur
+    prosody_scale      = 0.2   # Prevents pitch/energy embeddings from drowning out text phonetics
 
     # --- Staged Training Schedule ---
     stage1_steps     = 25_000

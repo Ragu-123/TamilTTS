@@ -40,21 +40,47 @@ def masked_l1(pred, target, lens):
     return (loss * mask).sum() / denom
 
 
+class SpectralConvergenceLoss(nn.Module):
+    """
+    Spectral Convergence Loss: ||S_true - S_pred||_F / ||S_true||_F.
+    Forces sharp spectral peakiness and penalizes blurry conditional-mean mel predictions.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, mel_pred, mel_target, mel_lens=None):
+        min_t = min(mel_pred.size(1), mel_target.size(1))
+        pred = mel_pred[:, :min_t]
+        target = mel_target[:, :min_t]
+
+        if mel_lens is not None:
+            lens = mel_lens.to(pred.device).long()
+            mask = (torch.arange(min_t, device=pred.device).unsqueeze(0) < lens.unsqueeze(1)).float()
+            pred = pred * mask.unsqueeze(-1)
+            target = target * mask.unsqueeze(-1)
+
+        diff = (target.float() - pred.float()).norm(p="fro", dim=(-2, -1))
+        denom = torch.clamp(target.float().norm(p="fro", dim=(-2, -1)), min=1e-5)
+        return (diff / denom).mean()
+
+
 class MelLoss(nn.Module):
     """
-    Masked Dual Mel-Spectrogram Loss.
+    Masked Dual Mel-Spectrogram Loss + Spectral Convergence.
     Targets are the normalized [B, 80, Tm] mel transposed to [B, Tm, 80].
     `lowband_w` multiplies the L1 on the lowest `lowband_bins` mel bins: measured
     +0.46 low-frequency bias (drone) in trained models needs extra pressure there.
     Returns (weighted_total, l_refined, l_coarse).
     """
 
-    def __init__(self, coarse_w=0.5, refined_w=1.0, lowband_w=1.0, lowband_bins=10):
+    def __init__(self, coarse_w=0.5, refined_w=1.0, sc_w=1.0, lowband_w=1.0, lowband_bins=10):
         super().__init__()
         self.coarse_w = coarse_w
         self.refined_w = refined_w
+        self.sc_w = sc_w
         self.lowband_w = lowband_w
         self.lowband_bins = lowband_bins
+        self.sc_loss = SpectralConvergenceLoss()
 
     def _masked_l1_binned(self, pred, target, lens):
         """Per-bin masked L1: [B, Tm, 80] -> [80]."""
@@ -79,7 +105,8 @@ class MelLoss(nn.Module):
             w[:self.lowband_bins] = self.lowband_w
         l_refined = (bins_ref * w).mean()
         l_coarse = (bins_crs * w).mean()
-        total = self.refined_w * l_refined + self.coarse_w * l_coarse
+        l_sc = self.sc_loss(mel_pred, target, mel_lens) if self.sc_w > 0 else torch.zeros((), device=mel_pred.device)
+        total = self.refined_w * l_refined + self.coarse_w * l_coarse + self.sc_w * l_sc
         return total, l_refined, l_coarse
 
 
