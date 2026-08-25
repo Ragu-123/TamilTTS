@@ -50,7 +50,7 @@ class Config:
     num_workers      = 8
     prefetch_factor  = 4
     learning_rate    = 1.5e-4
-    disc_lr          = 1e-4
+    disc_lr          = 2e-5   # Low LR for stable fine-tuning
     weight_decay     = 0.01
     warmup_steps     = 3_000
     save_every       = 2_000
@@ -65,16 +65,16 @@ class Config:
     weight_dur         = 1.0
     weight_f0          = 1.0
     weight_energy      = 1.0
-    weight_adv         = 1.0
-    weight_fm          = 1.0
+    weight_adv         = 0.2   # Gentle fine-tuning weight: never overpowers phonetic mel loss
+    weight_fm          = 0.5
     weight_slm_final   = 0.1
     weight_mel_lowband = 2.0   # extra L1 weight on lowest 10 mel bins: counters low-freq bias
     weight_sc          = 1.0   # Spectral Convergence: forces sharp harmonic peaks & penalizes mel blur
     prosody_scale      = 0.2   # Prevents pitch/energy embeddings from drowning out text phonetics
 
     # --- Training Schedule ---
-    stage1_steps     = 0       # Unified GAN training from Step 1
-    slm_start_step   = 40_000
+    stage1_steps     = 60_000  # Pure acoustic regression until step 60k, then gentle GAN fine-tuning
+    slm_start_step   = 90_000
     slm_ramp_steps   = 10_000
     use_gt_durations = True
     style_dropout_p  = 0.5
