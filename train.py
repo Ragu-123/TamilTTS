@@ -685,15 +685,20 @@ def train_worker(local_rank, world_size, cfg):
 
                     if is_main_process(local_rank):
                         stage_tag = "GAN+SLM" if cur_slm_w > 0.0 else ("GAN" if gan_active else "REG")
-                        pbar.set_postfix({
+                        postfix_dict = {
                             "step": global_step,
                             "stage": stage_tag,
                             "loss": f"{float(g_loss.item()):.2f}",
                             "mel": f"{float(l_ref.item()):.3f}",
-                            "d": f"{d_loss_val:.3f}",
-                            "adv": f"{adv_val:.3f}",
+                            "dur": f"{float(loss_dur.item()):.3f}",
+                            "f0": f"{float(loss_f0.item()):.3f}",
+                            "eng": f"{float(loss_energy.item()):.3f}",
                             "lr": f"{sched_g.get_last_lr()[0]:.1e}",
-                        })
+                        }
+                        if gan_active:
+                            postfix_dict["d"] = f"{d_loss_val:.3f}"
+                            postfix_dict["adv"] = f"{adv_val:.3f}"
+                        pbar.set_postfix(postfix_dict)
 
                     if global_step > 0 and global_step % cfg.save_every == 0:
                         best_val_loss = maybe_validate_and_save(
