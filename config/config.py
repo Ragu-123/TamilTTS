@@ -73,8 +73,8 @@ class Config:
     prosody_scale      = 0.2   # Prevents pitch/energy embeddings from drowning out text phonetics
 
     # --- Training Schedule ---
-    stage1_steps     = 60_000  # Pure acoustic regression until step 60k, then gentle GAN fine-tuning
-    slm_start_step   = 90_000
+    stage1_steps     = 120_000  # Pure acoustic regression until step 120k (~110 epochs), then gentle GAN fine-tuning
+    slm_start_step   = 135_000
     slm_ramp_steps   = 10_000
     use_gt_durations = True
     style_dropout_p  = 0.5
