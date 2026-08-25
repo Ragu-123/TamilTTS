@@ -59,15 +59,18 @@ class PostNet(nn.Module):
             )
 
         # Final projection layer: postnet_dim -> mel_dim (no activation for residual)
+        final_conv = nn.Conv1d(
+            postnet_dim, mel_dim,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=(kernel_size - 1) // 2,
+            bias=True
+        )
+        nn.init.zeros_(final_conv.weight)
+        nn.init.zeros_(final_conv.bias)
         self.convolutions.append(
             nn.Sequential(
-                nn.Conv1d(
-                    postnet_dim, mel_dim,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding=(kernel_size - 1) // 2,
-                    bias=True
-                ),
+                final_conv,
                 nn.Dropout(dropout)
             )
         )

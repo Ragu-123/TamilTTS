@@ -169,8 +169,12 @@ class TamilTTSv2(nn.Module):
         h = self.mel_decoder(dec_in, style, mel_mask)                 # [B, Tm, H]
         mel_coarse = self.mel_proj(h)                                 # [B, Tm, 80]
         mel_pred = mel_coarse + self.postnet(mel_coarse)
+        
+        # Mask padding frames to acoustic silence (-11.5129) so padding never produces buzz
+        mel_coarse = mel_coarse.masked_fill(mel_mask.unsqueeze(-1), -11.5129)
+        mel_pred = mel_pred.masked_fill(mel_mask.unsqueeze(-1), -11.5129)
 
-        # 9. Audio synthesis (renumbered: mel decode is step 8, this is 9)
+        # 9. Audio synthesis
         gen_audio = None
         if return_audio:
             gen_audio = self.vocoder(mel_pred)
