@@ -304,7 +304,7 @@ class DirectParquetTamilDataset(Dataset):
 
                 dur_sum = int(round(gt_dur.sum().item()))
                 diff = mel_len - dur_sum
-                if abs(diff) <= max(10, int(0.05 * mel_len)):
+                if abs(diff) <= max(50, int(0.25 * mel_len)):
                     smooth_durs = regularize_durations(toks, durs, mel_len)
                     gt_dur = torch.tensor(smooth_durs, dtype=torch.float32)
                 else:

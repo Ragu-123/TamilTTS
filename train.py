@@ -284,20 +284,31 @@ def synthesize_samples(net, ema, val_loader, device, cfg, step):
     lines = []
     try:
         with amp_context(device, cfg):
-            out = net(
-                tokens, token_lens,
-                mel=None, mel_lens=None,
-                gt_dur=None,
-                ref_mel=ref_mel, ref_mel_lens=ref_mel_lens,
-                return_audio=True,
-            )
-        gen_audio = out.get("gen_audio") if isinstance(out, dict) else None
-        if gen_audio is not None:
             for i in range(n):
-                wav = gen_audio[i].float().detach().cpu().numpy().astype(np.float32)
-                fname = f"step_{step:07d}_sample_{i}.wav"
-                sf.write(os.path.join(samples_dir, fname), wav, cfg.sample_rate)
-                lines.append(f"{fname}\t{decode_tokens(tokens[i].tolist())}")
+                cur_tlen = int(token_lens[i].item())
+                cur_tok = tokens[i:i+1, :cur_tlen]
+                cur_tlens = token_lens[i:i+1]
+                cur_mlen = int(ref_mel_lens[i].item())
+                cur_ref = ref_mel[i:i+1, :, :cur_mlen]
+                cur_reflens = ref_mel_lens[i:i+1]
+
+                out = net(
+                    cur_tok, cur_tlens,
+                    mel=None, mel_lens=None,
+                    gt_dur=None,
+                    ref_mel=cur_ref, ref_mel_lens=cur_reflens,
+                    return_audio=True,
+                )
+                gen_audio = out.get("gen_audio") if isinstance(out, dict) else None
+                if gen_audio is not None:
+                    wav = gen_audio[0].float().detach().cpu().numpy().astype(np.float32)
+                    peak = np.max(np.abs(wav))
+                    if peak > 1e-4:
+                        wav = wav / max(peak, 1.0) * 0.95
+                    fname = f"step_{step:07d}_sample_{i}.wav"
+                    sf.write(os.path.join(samples_dir, fname), wav, cfg.sample_rate)
+                    clean_toks = cur_tok[0].tolist()
+                    lines.append(f"{fname}\t{decode_tokens(clean_toks)}")
     finally:
         net.train()
         ema.restore_backup(net)

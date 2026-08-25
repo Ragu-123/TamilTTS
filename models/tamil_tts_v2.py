@@ -105,17 +105,17 @@ class TamilTTSv2(nn.Module):
 
         # 4. Duration prediction
         log_dur = self.duration_head(x, text_mask)                    # [B, Tt]
-        dur_pred = torch.exp(log_dur).clamp(0.0, 100.0)
+        dur_pred = torch.exp(log_dur).clamp(1.0, 100.0)
         dur_pred = dur_pred.masked_fill(text_mask, 0.0)
 
-        # 5. Expansion
+        # 5. Expansion (strictly 0 frames for padding tokens)
         if gt_dur is not None:
-            durations = gt_dur.float()
+            durations = gt_dur.float().masked_fill(text_mask, 0.0)
         else:
-            durations = torch.round(dur_pred).clamp(min=1)
+            durations = torch.round(dur_pred).masked_fill(text_mask, 0.0)
 
-        rounded = torch.round(durations).clamp(min=1).long()
-        out_lens = rounded.sum(dim=1)
+        rounded = durations.long()
+        out_lens = rounded.sum(dim=1).clamp(min=16)
 
         if gt_dur is not None and mel_lens is not None:
             # DataParallel splits the batch per-GPU; each replica would otherwise
